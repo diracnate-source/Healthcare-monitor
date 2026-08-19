@@ -1,0 +1,10 @@
+streamlit
+streamlit-webrtc
+opencv-python-headless
+mediapipe
+librosa
+soundfile
+torch
+torchvision
+transformers
+tokenizers
