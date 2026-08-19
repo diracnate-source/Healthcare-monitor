@@ -1,19 +1,4 @@
-import subprocess
-import sys
-import time
-import re
-from pyngrok import ngrok
-
-print("🔧 [1/4] 필수 패키지 설치 중...")
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "streamlit", "streamlit-webrtc", "opencv-python-headless", "mediapipe", "librosa", "soundfile", "torch", "torchvision", "transformers", "tokenizers", "pyngrok"])
-
-# 🔑 제공해주신 ngrok 인증 토큰 설정
-NGROK_AUTH_TOKEN = "3I5zzOGwVzI0RfSSqPfSwBbP8SV_51TmUqG4N9KPHiqcJM5PW"
-ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-
-print("📝 [2/4] app.py 생성 중...")
-
-app_code = """import streamlit as st
+import streamlit as st
 import cv2
 import numpy as np
 import time
@@ -86,23 +71,3 @@ elif st.session_state.step == "result":
     if st.button("🔄 처음으로 돌아가기", type="primary", use_container_width=True):
         st.session_state.step = "check"
         st.rerun()
-"""
-
-clean_code = re.sub(r'[\xa0\u200b\u200c\u200d]', ' ', app_code)
-with open("app.py", "w", encoding="utf-8") as f:
-    f.write(clean_code)
-
-!pkill -f streamlit
-
-print("\n🚀 [3/4] 스트림릿 서버 구동 중...")
-subprocess.Popen(["streamlit", "run", "app.py", "--server.port=8501", "--server.address=127.0.0.1"])
-time.sleep(6)
-
-print("\n🚀 [4/4] ngrok 터널 생성 중...")
-ngrok.kill()
-public_url = ngrok.connect(8501).public_url
-
-print("\n" + "="*65)
-print("✨ 인증 완료! 아래 링크를 클릭하시면 웹소켓 차단 없이 바로 접속됩니다:")
-print(public_url)
-print("="*65)
