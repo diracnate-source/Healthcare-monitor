@@ -1,4 +1,4 @@
-Plaintext
-streamlit
-streamlit-webrtc
-opencv-python-headless
+streamlit==1.32.0
+streamlit-webrtc==0.47.3
+opencv-python-headless==4.9.0.80
+numpy<2.0
