@@ -2,3 +2,5 @@ streamlit>=1.35.0
 streamlit-webrtc>=0.47.0
 opencv-python-headless>=4.9.0
 numpy>=1.26.0
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
