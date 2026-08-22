@@ -1,6 +1,7 @@
 import streamlit as st
 import cv2
 import numpy as np
+from collections import deque
 
 from streamlit_webrtc import (
     webrtc_streamer,
@@ -12,93 +13,115 @@ from av import VideoFrame
 
 
 # ============================================================
-# 1. Streamlit 기본 설정
+# 기본 설정
 # ============================================================
 
 st.set_page_config(
     page_title="안경 착용 엄격 검사",
-    page_icon="🧠",
+    page_icon="🔍",
     layout="centered",
 )
 
-st.title("🧠 AI 비접촉 멀티모달 뇌 건강 모니터링 시스템")
+st.markdown(
+    """
+    <style>
+    .main-title {
+        text-align: center;
+        font-size: 32px;
+        font-weight: 800;
+        margin-bottom: 10px;
+    }
 
-st.markdown("---")
+    .guide {
+        padding: 15px;
+        border-radius: 12px;
+        background: #eef6ff;
+        margin-bottom: 15px;
+        font-size: 16px;
+    }
 
-st.info(
-    "촬영 전 안경·선글라스·마스크·모자를 벗고 "
-    "정면을 바라봐 주세요.\n\n"
-    "안경 착용이 감지되거나 판정이 불확실하면 "
-    "촬영을 허용하지 않습니다."
+    .ok-box {
+        padding: 18px;
+        border-radius: 12px;
+        background: #e9fff0;
+        border: 2px solid #00c853;
+        color: #008a3e;
+        font-size: 24px;
+        font-weight: 800;
+        text-align: center;
+    }
+
+    .bad-box {
+        padding: 18px;
+        border-radius: 12px;
+        background: #fff0f0;
+        border: 2px solid #ff3030;
+        color: #d60000;
+        font-size: 24px;
+        font-weight: 800;
+        text-align: center;
+    }
+
+    .wait-box {
+        padding: 18px;
+        border-radius: 12px;
+        background: #fff9e6;
+        border: 2px solid #ffb300;
+        color: #a86b00;
+        font-size: 22px;
+        font-weight: 800;
+        text-align: center;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+st.markdown(
+    '<div class="main-title">🔍 안경 착용 엄격 검사</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="guide">
+    촬영 전 <b>안경·선글라스·마스크·모자</b>를 벗고
+    정면을 바라봐 주세요.<br><br>
+    안경 착용이 확인되거나 판정이 불확실하면
+    <b>촬영을 허용하지 않습니다.</b>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# 2. OpenCV 환경 검사
+# OpenCV 확인
 # ============================================================
 
-def check_opencv():
+if not hasattr(cv2, "CascadeClassifier"):
 
-    required_functions = [
-        "CascadeClassifier",
-        "cvtColor",
-        "equalizeHist",
-        "rectangle",
-        "putText",
-    ]
+    st.error("❌ OpenCV가 정상적으로 로딩되지 않았습니다.")
 
-    missing = []
-
-    for name in required_functions:
-        if not hasattr(cv2, name):
-            missing.append(name)
-
-    if missing:
-        st.error("❌ OpenCV 초기화에 실패했습니다.")
-
-        st.code(
-            f"""
+    st.code(
+        f"""
 OpenCV version:
 {getattr(cv2, "__version__", "unknown")}
 
 OpenCV path:
 {getattr(cv2, "__file__", "unknown")}
-
-누락된 기능:
-{", ".join(missing)}
 """
-        )
+    )
 
-        st.warning(
-            "현재 Python 환경에서 OpenCV가 정상적으로 로딩되지 않았습니다. "
-            "requirements.txt의 OpenCV 패키지를 확인하세요."
-        )
-
-        return False
-
-    return True
-
-
-if not check_opencv():
     st.stop()
 
 
 # ============================================================
-# 3. Haar Cascade 경로
+# Haar Cascade
 # ============================================================
 
-try:
-
-    CASCADE_DIR = cv2.data.haarcascades
-
-except Exception as e:
-
-    st.error("❌ OpenCV Haar Cascade 경로를 찾을 수 없습니다.")
-
-    st.code(str(e))
-
-    st.stop()
-
+CASCADE_DIR = cv2.data.haarcascades
 
 FACE_XML = (
     CASCADE_DIR +
@@ -116,237 +139,136 @@ GLASSES_XML = (
 )
 
 
-# ============================================================
-# 4. Cascade 로딩
-# ============================================================
+face_cascade = cv2.CascadeClassifier(FACE_XML)
+eye_cascade = cv2.CascadeClassifier(EYE_XML)
+glasses_cascade = cv2.CascadeClassifier(GLASSES_XML)
 
-try:
-
-    face_cascade = cv2.CascadeClassifier(
-        FACE_XML
-    )
-
-    eye_cascade = cv2.CascadeClassifier(
-        EYE_XML
-    )
-
-    glasses_cascade = cv2.CascadeClassifier(
-        GLASSES_XML
-    )
-
-except Exception as e:
-
-    st.error(
-        "❌ OpenCV CascadeClassifier 초기화 오류"
-    )
-
-    st.code(
-        f"""
-오류:
-{str(e)}
-
-OpenCV:
-{getattr(cv2, "__version__", "unknown")}
-
-Cascade 경로:
-{CASCADE_DIR}
-"""
-    )
-
-    st.stop()
-
-
-# ============================================================
-# 5. Cascade 파일 확인
-# ============================================================
 
 if face_cascade.empty():
-
-    st.error(
-        "❌ 얼굴 검출 모델을 불러오지 못했습니다."
-    )
-
-    st.code(FACE_XML)
-
+    st.error("❌ 얼굴 검출 모델을 불러오지 못했습니다.")
     st.stop()
 
 
 if eye_cascade.empty():
-
-    st.error(
-        "❌ 눈 검출 모델을 불러오지 못했습니다."
-    )
-
-    st.code(EYE_XML)
-
+    st.error("❌ 눈 검출 모델을 불러오지 못했습니다.")
     st.stop()
 
 
-if glasses_cascade.empty():
-
-    st.warning(
-        "⚠️ 안경 전용 Cascade를 사용할 수 없습니다."
-    )
-
-    st.info(
-        "안경 검출은 보수적으로 UNKNOWN 처리됩니다. "
-        "불확실한 경우 촬영을 허용하지 않습니다."
-    )
-
-
 # ============================================================
-# 6. 얼굴 / 눈 / 안경 분석
+# 안경 검출 함수
 # ============================================================
 
-def analyze_frame(frame):
+def detect_glasses(frame):
+
+    result = {
+        "status": "UNKNOWN",
+        "reason": "판정 대기",
+        "face": None,
+        "eyes": 0,
+        "glasses": 0,
+        "edge_score": 0.0,
+        "line_score": 0,
+    }
 
     if frame is None:
-
-        return {
-            "decision": "UNKNOWN",
-            "reason": "영상 프레임 없음",
-        }
+        return result
 
 
     # --------------------------------------------------------
-    # BGR → Gray
+    # Gray
     # --------------------------------------------------------
 
-    try:
-
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        gray = cv2.equalizeHist(
-            gray
-        )
-
-    except Exception as e:
-
-        return {
-            "decision": "UNKNOWN",
-            "reason": f"영상 처리 오류: {str(e)}",
-        }
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY
+    )
 
 
     # --------------------------------------------------------
-    # 얼굴 검출
+    # 얼굴 찾기
     # --------------------------------------------------------
 
-    try:
-
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.10,
-            minNeighbors=5,
-            minSize=(140, 140),
-        )
-
-    except Exception:
-
-        return {
-            "decision": "UNKNOWN",
-            "reason": "얼굴 검출 실패",
-        }
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.10,
+        minNeighbors=5,
+        minSize=(120, 120),
+    )
 
 
     if len(faces) == 0:
 
-        return {
-            "decision": "UNKNOWN",
-            "reason": "얼굴을 찾지 못함",
-        }
+        result["reason"] = "얼굴을 찾지 못했습니다."
+
+        return result
 
 
-    # 가장 큰 얼굴 선택
+    # 가장 큰 얼굴
     x, y, w, h = max(
         faces,
         key=lambda f: f[2] * f[3]
     )
 
-
-    # --------------------------------------------------------
-    # 얼굴 크기 확인
-    # --------------------------------------------------------
-
-    if w < 180 or h < 180:
-
-        return {
-            "decision": "UNKNOWN",
-            "reason": "얼굴이 너무 작음",
-        }
+    result["face"] = (
+        int(x),
+        int(y),
+        int(w),
+        int(h)
+    )
 
 
     # --------------------------------------------------------
-    # 눈 / 안경 검사 영역
+    # 얼굴이 너무 작으면 검사하지 않음
     # --------------------------------------------------------
 
-    rx1 = max(
+    if w < 170 or h < 170:
+
+        result["reason"] = "얼굴을 조금 더 가까이 해주세요."
+
+        return result
+
+
+    # --------------------------------------------------------
+    # 눈/안경 검사 영역
+    # --------------------------------------------------------
+
+    ex1 = max(
         0,
         int(x + 0.05 * w)
     )
 
-    rx2 = min(
+    ex2 = min(
         gray.shape[1],
         int(x + 0.95 * w)
     )
 
-    ry1 = max(
+    ey1 = max(
         0,
-        int(y + 0.15 * h)
+        int(y + 0.16 * h)
     )
 
-    ry2 = min(
+    ey2 = min(
         gray.shape[0],
-        int(y + 0.62 * h)
+        int(y + 0.58 * h)
     )
 
 
     eye_region = gray[
-        ry1:ry2,
-        rx1:rx2
+        ey1:ey2,
+        ex1:ex2
     ]
 
 
     if eye_region.size == 0:
 
-        return {
-            "decision": "UNKNOWN",
-            "reason": "눈 영역 생성 실패",
-        }
+        result["reason"] = "눈 영역을 만들 수 없습니다."
+
+        return result
 
 
     # ========================================================
-    # 안경 Cascade
+    # 눈 검출
     # ========================================================
-
-    glasses_count = 0
-
-    try:
-
-        if not glasses_cascade.empty():
-
-            glasses = glasses_cascade.detectMultiScale(
-                eye_region,
-                scaleFactor=1.04,
-                minNeighbors=2,
-                minSize=(24, 18),
-            )
-
-            glasses_count = len(glasses)
-
-    except Exception:
-
-        glasses_count = 0
-
-
-    # ========================================================
-    # 눈 Cascade
-    # ========================================================
-
-    eyes_count = 0
 
     try:
 
@@ -357,136 +279,244 @@ def analyze_frame(frame):
             minSize=(22, 18),
         )
 
-        eyes_count = len(eyes)
+        eye_count = len(eyes)
 
     except Exception:
 
-        eyes_count = 0
+        eye_count = 0
+
+
+    result["eyes"] = eye_count
 
 
     # ========================================================
-    # 안경테 형태 보조 분석
+    # 안경 Cascade
+    #
+    # 중요:
+    # 이것은 단독 판정에 사용하지 않는다.
     # ========================================================
+
+    glasses_count = 0
 
     try:
 
-        blurred = cv2.GaussianBlur(
-            eye_region,
-            (5, 5),
-            0
-        )
+        if not glasses_cascade.empty():
 
-        edges = cv2.Canny(
-            blurred,
-            45,
-            130
-        )
+            glasses = glasses_cascade.detectMultiScale(
+                eye_region,
+                scaleFactor=1.05,
+                minNeighbors=3,
+                minSize=(25, 18),
+            )
 
-        edge_ratio = float(
-            np.mean(edges > 0)
-        )
+            glasses_count = len(glasses)
 
     except Exception:
 
-        edge_ratio = 0.0
+        glasses_count = 0
+
+
+    result["glasses"] = glasses_count
 
 
     # ========================================================
-    # 1차 판정
+    # 안경테 구조 분석
+    #
+    # 단순 glasses cascade가 아니라
+    # 눈 주변의 프레임 형태를 보조적으로 검사한다.
     # ========================================================
 
-    # 안경 Cascade가 잡히면 즉시 부적합 후보
-    if glasses_count >= 1:
-
-        return {
-            "decision": "GLASSES",
-            "reason": (
-                f"안경 패턴 검출 "
-                f"(cascade={glasses_count})"
-            ),
-            "glasses": glasses_count,
-            "eyes": eyes_count,
-            "edge": edge_ratio,
-        }
+    resized = cv2.resize(
+        eye_region,
+        (320, 180)
+    )
 
 
-    # --------------------------------------------------------
-    # 안경테가 의심되는 경우
-    # --------------------------------------------------------
+    # 조명 차이를 줄이기 위한 CLAHE
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
 
-    if edge_ratio >= 0.095:
+    normalized = clahe.apply(
+        resized
+    )
 
-        return {
-            "decision": "UNKNOWN",
-            "reason": (
-                f"안경테 의심 "
-                f"(edge={edge_ratio:.3f})"
-            ),
-            "glasses": glasses_count,
-            "eyes": eyes_count,
-            "edge": edge_ratio,
-        }
+
+    blurred = cv2.GaussianBlur(
+        normalized,
+        (5, 5),
+        0
+    )
+
+
+    edges = cv2.Canny(
+        blurred,
+        50,
+        150
+    )
 
 
     # --------------------------------------------------------
-    # 양쪽 눈이 확인되면 무안경 후보
+    # Edge density
     # --------------------------------------------------------
 
-    if eyes_count >= 2:
+    edge_score = float(
+        np.mean(edges > 0)
+    )
 
-        return {
-            "decision": "NO_GLASSES",
-            "reason": (
-                f"양쪽 눈 확인 "
-                f"(eyes={eyes_count})"
-            ),
-            "glasses": glasses_count,
-            "eyes": eyes_count,
-            "edge": edge_ratio,
-        }
+
+    result["edge_score"] = edge_score
 
 
     # --------------------------------------------------------
-    # 그 외
+    # 선분 검사
     # --------------------------------------------------------
 
-    return {
-        "decision": "UNKNOWN",
-        "reason": (
-            f"눈 검출 불충분 "
-            f"(eyes={eyes_count})"
-        ),
-        "glasses": glasses_count,
-        "eyes": eyes_count,
-        "edge": edge_ratio,
-    }
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=25,
+        minLineLength=25,
+        maxLineGap=5,
+    )
+
+
+    horizontal = 0
+    vertical = 0
+
+
+    if lines is not None:
+
+        for line in lines[:, 0]:
+
+            x1, y1, x2, y2 = line
+
+            angle = abs(
+                np.degrees(
+                    np.arctan2(
+                        y2 - y1,
+                        x2 - x1
+                    )
+                )
+            )
+
+
+            if (
+                angle < 12
+                or angle > 168
+            ):
+
+                horizontal += 1
+
+
+            if (
+                78 < angle < 102
+            ):
+
+                vertical += 1
+
+
+    line_score = (
+        horizontal +
+        vertical
+    )
+
+
+    result["line_score"] = line_score
+
+
+    # ========================================================
+    # 핵심 판정
+    # ========================================================
+
+    #
+    # 1) 강한 안경 프레임 증거
+    #
+    # 현재 테스트 사진의 맨눈 오탐을 줄이기 위해
+    # edge + line을 함께 요구한다.
+    #
+
+    strong_frame = (
+        edge_score >= 0.055
+        and
+        line_score >= 8
+    )
+
+
+    #
+    # 2) Cascade + 프레임 구조가 동시에 의심되는 경우
+    #
+
+    cascade_frame = (
+        glasses_count >= 2
+        and
+        edge_score >= 0.045
+    )
+
+
+    #
+    # 3) 최종 안경 의심
+    #
+
+    if strong_frame or cascade_frame:
+
+        result["status"] = "GLASSES"
+
+        result["reason"] = (
+            "안경테 구조가 반복적으로 의심됩니다."
+        )
+
+        return result
+
+
+    # ========================================================
+    # 맨눈 후보
+    # ========================================================
+
+    if eye_count >= 2:
+
+        result["status"] = "NO_GLASSES"
+
+        result["reason"] = (
+            "양쪽 눈이 확인되었습니다."
+        )
+
+        return result
+
+
+    # ========================================================
+    # 불확실
+    # ========================================================
+
+    result["status"] = "UNKNOWN"
+
+    result["reason"] = (
+        "눈 또는 안경 상태를 확실하게 판단할 수 없습니다."
+    )
+
+    return result
 
 
 # ============================================================
-# 7. WebRTC 영상 처리 클래스
+# WebRTC Processor
 # ============================================================
 
 class GlassesProcessor(VideoProcessorBase):
 
     def __init__(self):
 
-        self.frames = 0
+        self.history = deque(
+            maxlen=12
+        )
 
-        self.glasses_votes = 0
+        self.last_result = None
 
-        self.no_glasses_votes = 0
-
-        self.unknown_votes = 0
-
-        self.last_decision = "UNKNOWN"
-
-        self.last_reason = "카메라 준비 중"
+        self.frame_count = 0
 
 
-    def recv(
-        self,
-        frame: VideoFrame
-    ) -> VideoFrame:
+    def recv(self, frame):
 
         try:
 
@@ -503,58 +533,58 @@ class GlassesProcessor(VideoProcessorBase):
         # 분석
         # ----------------------------------------------------
 
-        result = analyze_frame(
+        result = detect_glasses(
             img
         )
 
 
-        self.frames += 1
+        self.last_result = result
 
-        self.last_decision = (
-            result["decision"]
-        )
+        self.frame_count += 1
 
-        self.last_reason = (
-            result["reason"]
+
+        # 최근 판정 저장
+        self.history.append(
+            result["status"]
         )
 
 
         # ----------------------------------------------------
-        # 투표 누적
+        # 최종 표시 상태
         # ----------------------------------------------------
 
-        if result["decision"] == "GLASSES":
+        final_status = self.get_final_status()
 
-            self.glasses_votes += 1
-
-        elif result["decision"] == "NO_GLASSES":
-
-            self.no_glasses_votes += 1
-
-        else:
-
-            self.unknown_votes += 1
-
-
-        # ====================================================
-        # 화면 표시
-        # ====================================================
 
         h, w = img.shape[:2]
 
 
-        x1 = int(w * 0.20)
-        y1 = int(h * 0.10)
-
-        x2 = int(w * 0.80)
-        y2 = int(h * 0.90)
-
-
         # ----------------------------------------------------
-        # 색상 및 문구
+        # 얼굴 박스
         # ----------------------------------------------------
 
-        if self.last_decision == "GLASSES":
+        face = result.get(
+            "face"
+        )
+
+
+        if face is not None:
+
+            x, y, fw, fh = face
+
+        else:
+
+            x = int(w * 0.20)
+            y = int(h * 0.10)
+            fw = int(w * 0.60)
+            fh = int(h * 0.80)
+
+
+        # ====================================================
+        # 상태별 색상
+        # ====================================================
+
+        if final_status == "GLASSES":
 
             color = (
                 0,
@@ -562,12 +592,12 @@ class GlassesProcessor(VideoProcessorBase):
                 255
             )
 
-            text = (
+            message = (
                 "NOT ELIGIBLE - GLASSES"
             )
 
 
-        elif self.last_decision == "NO_GLASSES":
+        elif final_status == "NO_GLASSES":
 
             color = (
                 0,
@@ -575,8 +605,8 @@ class GlassesProcessor(VideoProcessorBase):
                 0
             )
 
-            text = (
-                "NO GLASSES - CHECKING"
+            message = (
+                "ELIGIBLE - NO GLASSES"
             )
 
 
@@ -588,40 +618,47 @@ class GlassesProcessor(VideoProcessorBase):
                 255
             )
 
-            text = (
+            message = (
                 "CHECKING - DO NOT SHOOT"
             )
 
 
         # ----------------------------------------------------
-        # 얼굴 가이드 박스
+        # 얼굴 가이드
         # ----------------------------------------------------
 
-        try:
-
-            cv2.rectangle(
-                img,
-                (x1, y1),
-                (x2, y2),
-                color,
-                2,
-            )
+        cv2.rectangle(
+            img,
+            (x, y),
+            (x + fw, y + fh),
+            color,
+            3
+        )
 
 
-            cv2.putText(
-                img,
-                text,
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.70,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
+        # ----------------------------------------------------
+        # 상단 상태
+        # ----------------------------------------------------
 
-        except Exception:
+        cv2.rectangle(
+            img,
+            (10, 10),
+            (min(w - 10, 560), 55),
+            (0, 0, 0),
+            -1
+        )
 
-            pass
+
+        cv2.putText(
+            img,
+            message,
+            (20, 43),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            color,
+            2,
+            cv2.LINE_AA
+        )
 
 
         return VideoFrame.from_ndarray(
@@ -630,77 +667,75 @@ class GlassesProcessor(VideoProcessorBase):
         )
 
 
-# ============================================================
-# 8. 여러 프레임 최종 판정
-# ============================================================
+    # ========================================================
+    # 최근 프레임 종합 판정
+    # ========================================================
 
-def get_final_decision(
-    processor
-):
+    def get_final_status(self):
 
-    if processor is None:
+        if len(self.history) < 6:
 
-        return "UNKNOWN"
+            return "UNKNOWN"
 
 
-    total = (
-        processor.glasses_votes
-        + processor.no_glasses_votes
-        + processor.unknown_votes
-    )
-
-
-    # 최소 8프레임 필요
-    if total < 8:
-
-        return "UNKNOWN"
-
-
-    # --------------------------------------------------------
-    # 안경이 한 번이라도 확실히 검출되면 차단
-    # --------------------------------------------------------
-
-    if processor.glasses_votes >= 1:
-
-        return "GLASSES"
-
-
-    # --------------------------------------------------------
-    # 불확실성이 20% 이상이면 차단
-    # --------------------------------------------------------
-
-    if (
-        processor.unknown_votes
-        >
-        max(
-            1,
-            int(total * 0.20)
+        history = list(
+            self.history
         )
-    ):
+
+
+        glasses = history.count(
+            "GLASSES"
+        )
+
+        no_glasses = history.count(
+            "NO_GLASSES"
+        )
+
+        unknown = history.count(
+            "UNKNOWN"
+        )
+
+
+        # ====================================================
+        # 1. 안경
+        #
+        # 최근 12프레임 중 3프레임 이상
+        # 강한 안경 증거가 있으면 부적합
+        # ====================================================
+
+        if glasses >= 3:
+
+            return "GLASSES"
+
+
+        # ====================================================
+        # 2. 불확실
+        #
+        # 애매한 프레임이 너무 많으면 촬영 금지
+        # ====================================================
+
+        if unknown >= 5:
+
+            return "UNKNOWN"
+
+
+        # ====================================================
+        # 3. 맨눈
+        #
+        # 최소 6프레임 이상 맨눈 확인
+        # ====================================================
+
+        if no_glasses >= 6:
+
+            return "NO_GLASSES"
+
 
         return "UNKNOWN"
 
 
-    # --------------------------------------------------------
-    # 최소 8개 이상의 무안경 프레임
-    # --------------------------------------------------------
-
-    if processor.no_glasses_votes >= 8:
-
-        return "NO_GLASSES"
-
-
-    return "UNKNOWN"
-
-
 # ============================================================
-# 9. Session State
+# Session State
 # ============================================================
-
-if "step" not in st.session_state:
-
-    st.session_state.step = "check"
-
 
 if "capture_allowed" not in st.session_state:
 
@@ -708,265 +743,222 @@ if "capture_allowed" not in st.session_state:
 
 
 # ============================================================
-# 10. 1단계 — 안경 검사
+# 카메라
 # ============================================================
 
-if st.session_state.step == "check":
+st.subheader(
+    "📷 카메라 검사"
+)
 
-    st.subheader(
-        "🔍 1단계: 안경 착용 엄격 검사"
+
+st.write(
+    "얼굴을 화면 중앙에 맞추고 "
+    "잠시 정면을 바라봐 주세요."
+)
+
+
+st.caption(
+    "안경 착용 → 촬영 불가"
+)
+
+
+st.caption(
+    "판정 불확실 → 촬영 불가"
+)
+
+
+st.caption(
+    "맨눈 확인 → 촬영 가능"
+)
+
+
+# ============================================================
+# WebRTC
+# ============================================================
+
+ctx = webrtc_streamer(
+
+    key="strict-glasses-check-v3",
+
+    mode=WebRtcMode.SENDRECV,
+
+    video_processor_factory=GlassesProcessor,
+
+    media_stream_constraints={
+        "video": True,
+        "audio": False,
+    },
+
+    async_processing=True,
+
+    rtc_configuration={
+        "iceServers": [
+            {
+                "urls": [
+                    "stun:stun.l.google.com:19302"
+                ]
+            }
+        ]
+    },
+)
+
+
+# ============================================================
+# 판정 결과
+# ============================================================
+
+if ctx.video_processor:
+
+    processor = (
+        ctx.video_processor
     )
 
 
-    st.write(
-        "카메라를 켜고 얼굴을 가이드 박스 안에 "
-        "위치시키세요."
+    final_status = (
+        processor.get_final_status()
     )
 
 
-    st.write(
-        "안경 착용이 감지되면 즉시 촬영이 차단됩니다."
+    result = (
+        processor.last_result
     )
 
 
-    st.write(
-        "판정이 애매한 경우에도 촬영을 허용하지 않습니다."
-    )
+    # --------------------------------------------------------
+    # 1. 맨눈
+    # --------------------------------------------------------
 
+    if final_status == "NO_GLASSES":
 
-    # ========================================================
-    # WebRTC
-    # ========================================================
-
-    ctx = webrtc_streamer(
-
-        key="strict-glasses-check",
-
-        mode=WebRtcMode.SENDRECV,
-
-        video_processor_factory=GlassesProcessor,
-
-        media_stream_constraints={
-            "video": True,
-            "audio": False,
-        },
-
-        rtc_configuration={
-            "iceServers": [
-                {
-                    "urls": [
-                        "stun:stun.l.google.com:19302"
-                    ]
-                }
-            ]
-        },
-    )
-
-
-    # ========================================================
-    # 판정 표시
-    # ========================================================
-
-    if ctx.video_processor:
-
-        processor = (
-            ctx.video_processor
+        st.markdown(
+            """
+            <div class="ok-box">
+            ✅ 촬영 가능합니다
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
 
-        # ----------------------------------------------------
-        # 현재 통계
-        # ----------------------------------------------------
-
-        st.caption(
-            f"검사 프레임: {processor.frames} | "
-            f"안경 검출: {processor.glasses_votes} | "
-            f"무안경: {processor.no_glasses_votes} | "
-            f"불확실: {processor.unknown_votes}"
+        st.success(
+            "안경이 확인되지 않았습니다. "
+            "촬영 조건을 충족했습니다."
         )
 
 
-        # ----------------------------------------------------
-        # 최종 판정
-        # ----------------------------------------------------
+        st.session_state.capture_allowed = True
 
-        final = get_final_decision(
-            processor
+
+    # --------------------------------------------------------
+    # 2. 안경
+    # --------------------------------------------------------
+
+    elif final_status == "GLASSES":
+
+        st.markdown(
+            """
+            <div class="bad-box">
+            ❌ 부적합 — 안경 착용
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
 
-        # ====================================================
-        # 안경 착용
-        # ====================================================
-
-        if final == "GLASSES":
-
-            st.error(
-                "❌ 부적합 — 안경 착용"
-            )
+        st.error(
+            "안경 착용이 의심됩니다. "
+            "안경을 벗고 다시 검사해주세요."
+        )
 
 
-            st.write(
-                "안경을 벗은 후 다시 검사해주세요."
-            )
+        st.session_state.capture_allowed = False
 
 
-            st.session_state.capture_allowed = False
-
-
-        # ====================================================
-        # 무안경
-        # ====================================================
-
-        elif final == "NO_GLASSES":
-
-            st.success(
-                "✅ 촬영 가능합니다"
-            )
-
-
-            st.write(
-                "안경 미착용 상태가 확인되었습니다."
-            )
-
-
-            st.session_state.capture_allowed = True
-
-
-        # ====================================================
-        # 불확실
-        # ====================================================
-
-        else:
-
-            st.warning(
-                "⚠️ 검사 중 — 아직 촬영할 수 없습니다."
-            )
-
-
-            st.write(
-                "정면을 바라보고 얼굴을 가이드 박스 "
-                "안에 위치시켜 주세요."
-            )
-
-
-            st.session_state.capture_allowed = False
-
-
-    # ========================================================
-    # 촬영 버튼
-    # ========================================================
-
-    st.markdown("---")
-
-
-    if st.session_state.capture_allowed:
-
-        if st.button(
-            "📸 촬영하기",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            st.session_state.step = "result"
-
-            st.rerun()
-
+    # --------------------------------------------------------
+    # 3. 불확실
+    # --------------------------------------------------------
 
     else:
 
-        st.button(
-            "🔒 촬영 불가 — 안경 검사 통과 필요",
-            disabled=True,
-            use_container_width=True,
+        st.markdown(
+            """
+            <div class="wait-box">
+            ⚠️ 검사 중 — 촬영 불가
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
 
-    st.caption(
-        "※ 현재 안경 검사는 OpenCV 기반 사전검사입니다. "
-        "100% 정확한 안경 분류를 보장하는 의료용 AI 모델은 아닙니다."
-    )
+        st.warning(
+            "판정이 아직 확실하지 않습니다. "
+            "정면을 바라보고 잠시 기다려주세요."
+        )
+
+
+        st.session_state.capture_allowed = False
+
+
+    # ========================================================
+    # 검사 정보
+    # ========================================================
+
+    if result is not None:
+
+        st.caption(
+            f"검사 프레임: {processor.frame_count}"
+        )
+
+        st.caption(
+            f"최근 눈 검출: {result.get('eyes', 0)}"
+        )
+
+        st.caption(
+            f"최근 안경 Cascade: {result.get('glasses', 0)}"
+        )
+
+        st.caption(
+            f"프레임 구조 점수: "
+            f"{result.get('edge_score', 0):.3f}"
+        )
 
 
 # ============================================================
-# 11. 2단계 — 촬영 후 분석 화면
+# 촬영 버튼
 # ============================================================
 
-elif st.session_state.step == "result":
-
-    st.subheader(
-        "📋 2단계: 비접촉 멀티모달 뇌 건강 모니터링"
-    )
+st.markdown("---")
 
 
-    st.success(
-        "✅ 촬영 조건을 통과했습니다."
-    )
-
-
-    st.info(
-        "안경 착용 검사 통과 후 다음 단계의 "
-        "비접촉 측정을 진행할 수 있습니다."
-    )
-
-
-    # ========================================================
-    # 지표
-    # ========================================================
-
-    col1, col2 = st.columns(2)
-
-
-    with col1:
-
-        st.metric(
-            "언어 유창성 지표",
-            "측정 대기"
-        )
-
-
-        st.metric(
-            "머리 안정도 지표",
-            "측정 대기"
-        )
-
-
-    with col2:
-
-        st.metric(
-            "발화 리듬 지표",
-            "측정 대기"
-        )
-
-
-        st.metric(
-            "인지 반응성 지표",
-            "측정 대기"
-        )
-
-
-    st.markdown("---")
-
-
-    st.warning(
-        "⚠️ 현재 지표는 시연용입니다. "
-        "실제 뇌 건강 또는 치매 위험도를 판단하려면 "
-        "검증된 임상 알고리즘과 데이터가 필요합니다."
-    )
-
-
-    # ========================================================
-    # 처음으로
-    # ========================================================
+if st.session_state.capture_allowed:
 
     if st.button(
-        "🔄 안경 검사 다시 하기",
+        "📸 촬영하기",
         type="primary",
         use_container_width=True,
     ):
 
-        st.session_state.step = "check"
+        st.success(
+            "📸 촬영을 시작할 수 있습니다."
+        )
 
-        st.session_state.capture_allowed = False
+else:
 
-        st.rerun()
+    st.button(
+        "🔒 촬영 불가",
+        disabled=True,
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# 안내
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "※ 본 검사는 OpenCV 기반 비접촉 사전검사입니다. "
+    "조명·카메라·얼굴 각도에 따라 오판정이 발생할 수 있으며, "
+    "의료적 진단이나 공식 신원확인 용도로 사용해서는 안 됩니다."
+)
