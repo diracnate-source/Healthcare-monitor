@@ -6,31 +6,29 @@ st.set_page_config(
     page_icon="📷"
 )
 
-st.title("📷 웹캠 연결 테스트")
+st.title("📷 카메라 연결 테스트")
 
-st.write("START 버튼을 누르고 브라우저에서 카메라 사용을 허용하세요.")
+st.write("START를 누르고 브라우저에서 카메라 권한을 허용하세요.")
+
+def video_frame_callback(frame):
+    return frame
 
 ctx = webrtc_streamer(
-    key="camera-test-01",
+    key="camera_test",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={
         "video": True,
         "audio": False,
     },
+    video_frame_callback=video_frame_callback,
     rtc_configuration={
         "iceServers": [
-            {
-                "urls": [
-                    "stun:stun.l.google.com:19302"
-                ]
-            }
+            {"urls": ["stun:stun.l.google.com:19302"]}
         ]
     },
-    async_processing=True,
 )
 
 if ctx.state.playing:
     st.success("🟢 카메라 연결 성공")
-
 else:
     st.info("📷 START 버튼을 눌러주세요.")
