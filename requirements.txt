@@ -1,0 +1,17 @@
+streamlit
+numpy
+mediapipe
+streamlit-webrtc
+av
+
+# OpenCV 5.0.0.93은 haarcascade 데이터 파일이 누락된 패키징 버그가 있어
+# (opencv/opencv-python GitHub 이슈 #1244), 정상 동작이 확인된 4.13.0.92로
+# 명시적으로 버전을 고정합니다. mediapipe가 opencv-contrib-python을
+# 자동으로 요구하므로, 여기서 먼저 원하는 버전을 지정해 uv가 이 버전을
+# 쓰게 만듭니다.
+opencv-contrib-python==4.13.0.92
+
+# 학습 기반 위험도 모델(risk_model.app_py_adapter)에 필요
+scikit-learn
+pandas
+joblib
