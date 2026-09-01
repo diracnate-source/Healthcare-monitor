@@ -2547,3 +2547,20 @@ st.caption(
     "※ 본 프로그램은 촬영 전 사전 조건 확인용 프로토타입이며 "
     "의료적 진단을 대신하지 않습니다."
 )
+ ============================================================
+# 임시 디버그 코드 — 확인 끝나면 이 블록 전체를 삭제하고 다시 커밋하세요.
+# app.py 아무 곳(예: 파일 맨 아래)에 붙여넣으면 사이드바에 버튼이 생깁니다.
+# ============================================================
+import json as _debug_json
+import os as _debug_os
+ 
+with st.sidebar:
+    if st.button("🔧 population/baseline store 확인"):
+        for _fname in ["population_store.json", "baseline_store.json"]:
+            st.write(f"**{_fname}**")
+            if _debug_os.path.exists(_fname):
+                with open(_fname, "r", encoding="utf-8") as _f:
+                    st.json(_debug_json.load(_f))
+            else:
+                st.write("파일이 아직 없습니다 (한 번도 저장된 적 없음).")
+# ============================================================
