@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@2/dist/streamlit-component-lib.js"></script>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, "Malgun Gothic", sans-serif;
+  }
+  #box {
+    text-align: center;
+    padding: 60px 20px;
+    border-radius: 12px;
+    font-size: 20px;
+    color: white;
+    background-color: #333;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.05s;
+  }
+  #box.waiting { background-color: #333; }
+  #box.go { background-color: #2ecc71; font-weight: bold; font-size: 24px; }
+  #box.early { background-color: #e74c3c; }
+  #box.done { background-color: #555; }
+</style>
+</head>
+<body>
+<div id="box" class="waiting">🕒 준비하세요...</div>
+
+<script>
+  // 이 스크립트는 전부 사용자 브라우저 안에서 실행됩니다.
+  // 자극이 화면에 실제로 그려진 시점(stimulusTime)과, 사용자가
+  // 클릭한 시점을 전부 performance.now()로 브라우저 안에서만
+  // 측정하기 때문에, 서버 왕복(네트워크 지연)이 값에 섞이지 않습니다.
+  // 서버로는 오직 계산이 끝난 반응속도(ms) 숫자 하나만 전달합니다.
+
+  let timerStarted = false;
+  let stimulusTime = null;
+  let settled = false; // 클릭(정상 또는 너무 이른 클릭)으로 이번 라운드가 끝났는지
+
+  const box = document.getElementById("box");
+
+  function onRender(event) {
+    const args = event.detail.args;
+    const targetDelayMs = args.target_delay_ms;
+
+    if (!timerStarted) {
+      timerStarted = true;
+      box.className = "waiting";
+      box.innerHTML = "🕒 준비하세요...";
+
+      setTimeout(() => {
+        if (settled) return; // 이미 너무 일찍 클릭해서 라운드가 끝난 경우
+        stimulusTime = performance.now();
+        box.className = "go";
+        box.innerHTML = "🟢 지금 클릭하세요!";
+      }, targetDelayMs);
+    }
+
+    Streamlit.setFrameHeight(220);
+  }
+
+  box.addEventListener("click", () => {
+    if (settled) return;
+
+    if (stimulusTime === null) {
+      // 초록불 뜨기 전에 클릭 — 너무 이른 클릭(false start)
+      settled = true;
+      box.className = "early";
+      box.innerHTML = "⚠️ 너무 빨리 눌렀어요! 다시 준비합니다...";
+      Streamlit.setComponentValue({ status: "early", reaction_ms: null });
+      return;
+    }
+
+    settled = true;
+    const reactionMs = performance.now() - stimulusTime;
+    box.className = "done";
+    box.innerHTML = "✅ 완료: " + reactionMs.toFixed(0) + "ms";
+    Streamlit.setComponentValue({ status: "ok", reaction_ms: reactionMs });
+  });
+
+  Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+  Streamlit.setComponentReady();
+  Streamlit.setFrameHeight(220);
+</script>
+</body>
+</html>
