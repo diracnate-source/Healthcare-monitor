@@ -2370,98 +2370,109 @@ elif st.session_state.stage == "report":
             st.caption(f"📏 {ci.get('note', '')}")
 
         # ========================================================
-        # [신규] 통합 결과 (Fusion) — AI 경로와 양자 경로를 하나의
-        # 결론으로 합쳐서 바로 보여준다.
+        # [신규] 통합 결과 (Fusion) — 6개 지표 → (AI 분석 / QAOA 분석)
+        # → 통합 알고리즘(AI 예측 + QAOA 가중치 + 개인 baseline + 결과
+        # 일관성) → 최종 위험도 구조를, 지금 당장 동작하는 규칙 기반
+        # 버전으로 구현한 것 (risk_model/fusion_preview.py).
         #
-        # 주의: 여기서 "Fusion"은 risk_model/fusion_model.py의 학습된
-        # FusionModel(v4)이 아니다. FusionModel은 라벨 데이터 150건
-        # 이상 + legacy/v3 대비 검증된 우위 + 사람의 승인이 있어야
-        # is_reliable()이 True가 되는, 아직 준비되지 않은 챌린저다.
-        # 지금은 라벨 자체가 없어 그 모델을 쓸 수 없다.
-        #
-        # 그래서 여기서는 사람이 정한 아주 단순한 규칙 — "AI와 양자
-        # 두 판정 중 더 주의가 필요한 쪽을 최종 표시로 채택한다" —
-        # 으로 두 결과를 즉시 하나로 합쳐 보여준다. 이건 학습된
-        # 결합이 아니라 보수적 안전장치(worse-case wins)에 가깝고,
-        # 화면에도 그렇게 정직하게 라벨링한다. 나중에 FusionModel이
-        # 승격되면 이 규칙 기반 표시를 그 결과로 교체하면 된다.
+        # 주의: 이 구조를 "학습된 모델"로 구현한 진짜 버전은
+        # risk_model/fusion_model.py의 FusionModel(v4)이다. 그 모델은
+        # 라벨 데이터 150건 이상 + legacy/v3 대비 검증된 우위 + 사람의
+        # 승인이 있어야 is_reliable()이 True가 되는, 아직 준비되지
+        # 않은 챌린저다. 지금은 라벨 자체가 없어 그 모델을 쓸 수 없어서,
+        # 같은 4가지 입력(AI 예측/QAOA 가중치/개인 baseline/결과 일관성)을
+        # 사람이 정한 명시적 공식으로 결합한 잠정 버전을 대신 보여준다.
+        # 나중에 FusionModel이 승격되면 이 화면을 그 결과로 교체하면 된다.
         # ========================================================
-        _TIER_ORDER = {"양호": 0, "주의": 1, "확인 권장": 2}
+        from risk_model.fusion_preview import compute_fusion_preview
+
+        fusion = compute_fusion_preview(
+            ai_risk_score=risk_score,
+            quantum_result=quantum_result,
+            n_personal=detail.get("n_personal", 0),
+        )
+        fusion_style = TIER_STYLE[fusion.tier]
 
         st.markdown("### 🔗 통합 결과 (Fusion)")
 
+        st.markdown(
+            f"<div style='padding:16px;border-radius:10px;"
+            f"background-color:{fusion_style['color']}1A;"
+            f"border:2px solid {fusion_style['color']};'>"
+            f"<span style='font-size:22px;font-weight:700;"
+            f"color:{fusion_style['color']};'>{fusion_style['emoji']} {fusion.tier} "
+            f"— {fusion.fusion_score:.1f}점</span>"
+            f"<div style='margin-top:6px;font-size:13px;color:#555;'>{fusion.note}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
         if quantum_result is not None:
-            ai_tier = detail["tier"]
-            q_tier = quantum_result["tier"]
-            fusion_tier = ai_tier if _TIER_ORDER[ai_tier] >= _TIER_ORDER[q_tier] else q_tier
-            fusion_style = TIER_STYLE[fusion_tier]
-            agree = (ai_tier == q_tier)
-
-            st.markdown(
-                f"<div style='padding:16px;border-radius:10px;"
-                f"background-color:{fusion_style['color']}1A;"
-                f"border:2px solid {fusion_style['color']};'>"
-                f"<span style='font-size:22px;font-weight:700;"
-                f"color:{fusion_style['color']};'>{fusion_style['emoji']} {fusion_tier}</span>"
-                f"<div style='margin-top:6px;font-size:13px;color:#555;'>"
-                f"AI 경로({ai_tier})와 양자 경로({q_tier}) 중 더 주의가 필요한 "
-                f"판정을 채택한 통합 결과입니다."
-                f"</div></div>",
-                unsafe_allow_html=True
-            )
-            st.caption(
-                "⚙️ 지금 보이는 통합 결과는 학습된 Fusion 모델이 아니라, "
-                "'두 경로 중 더 주의가 필요한 쪽을 채택한다'는 단순 규칙으로 "
-                "즉시 계산한 잠정 결과입니다. 학습 기반 Fusion 모델은 라벨 "
-                "데이터가 충분히 쌓이고 검증·승인된 뒤에만 이 표시를 대체합니다."
-            )
-
-            st.markdown("##### 🤖 AI 경로 vs ⚛️ 양자 경로 (세부 비교)")
-            qcol1, qcol2 = st.columns(2)
-            with qcol1:
-                st.metric("AI 경로", f"{risk_score:.1f}점", ai_tier)
-            with qcol2:
+            st.markdown("##### 통합 알고리즘 구성 요소")
+            fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+            with fcol1:
+                st.metric("AI 예측", f"{fusion.ai_score:.1f}점")
+            with fcol2:
+                st.metric("QAOA 가중치 결과", f"{fusion.quantum_score:.1f}점")
+            with fcol3:
                 st.metric(
-                    "양자 경로 (QAOA)",
-                    f"{quantum_result['risk_score']:.1f}점",
-                    q_tier,
+                    "개인 baseline 반영도",
+                    f"{fusion.personal_confidence*100:.0f}%",
+                    help=f"개인 기록 {detail.get('n_personal', 0)}회 / 완전 반영 기준 8회"
                 )
-            if agree:
-                st.caption("✅ 두 경로가 같은 판정에 도달해, 통합 결과도 동일합니다.")
-            else:
+            with fcol4:
+                st.metric(
+                    "결과 일관성",
+                    f"{fusion.consistency*100:.0f}%",
+                    help="AI 경로와 QAOA 경로 판정이 얼마나 가까운지 (100%=완전 일치)"
+                )
+            st.caption(
+                f"통합 점수 = 개인 baseline 반영도만큼 (AI·QAOA 단순평균 "
+                f"{fusion.base_avg:.1f}점) 쪽으로, 나머지 비율만큼 (더 주의가 "
+                f"필요한 쪽 {fusion.conservative:.1f}점) 쪽으로 가중 결합 → "
+                f"**{fusion.fusion_score:.1f}점**"
+            )
+            if fusion.consistency < 0.7:
                 st.caption(
-                    f"⚠️ 두 경로의 판정이 다릅니다 (AI: {ai_tier} / 양자: {q_tier}). "
-                    "통합 결과는 이 중 더 주의가 필요한 쪽을 보여주며, 이 차이 "
-                    "자체의 임상적 의미는 아직 검증되지 않았습니다."
+                    "⚠️ AI 경로와 양자 경로의 결과 일관성이 낮습니다. 이런 세션은 "
+                    "통합 결과를 참고용으로만 보시고, 판단이 애매할 땐 재측정을 "
+                    "권합니다."
                 )
             if not quantum_result.get("qaoa_matched_true_optimum", True):
                 st.caption(
                     "ℹ️ 참고: 이번 세션의 양자 회로는 스스로 최적해를 찾지 못해 "
-                    "전수조사로 검증·보정된 값입니다 (양자 경로 점수 자체에는 "
-                    "영향이 없습니다 — 항상 검증된 값만 사용됩니다)."
+                    "전수조사로 검증·보정된 값입니다 (QAOA 점수 자체는 항상 "
+                    "검증된 값이 사용됩니다)."
                 )
+
+            with st.expander("🤖 AI 경로 vs ⚛️ 양자 경로 (세부 비교)"):
+                qcol1, qcol2 = st.columns(2)
+                with qcol1:
+                    st.metric("AI 경로", f"{risk_score:.1f}점", detail["tier"])
+                with qcol2:
+                    st.metric(
+                        "양자 경로 (QAOA)",
+                        f"{quantum_result['risk_score']:.1f}점",
+                        quantum_result["tier"],
+                    )
+                if quantum_result["tier"] == detail["tier"]:
+                    st.caption("✅ 두 경로가 같은 3단계 판정에 도달했습니다.")
+                else:
+                    st.caption(
+                        f"⚠️ 두 경로의 3단계 판정이 다릅니다 (AI: {detail['tier']} / "
+                        f"양자: {quantum_result['tier']})."
+                    )
             st.caption(
                 "이 비교는 매 세션 자동으로 기록되어, 향후 임상 라벨이 확보되면 "
                 "두 경로 중 어느 쪽이 실제 결과를 더 잘 예측했는지, 그리고 학습된 "
-                "Fusion 모델이 둘 중 하나보다 나은지를 사후 분석하는 데 쓰입니다."
+                "Fusion 모델이 이 규칙 기반 버전보다 나은지를 사후 분석하는 데 "
+                "쓰입니다."
             )
         else:
             # [2026-09-15 기준] 이제 부트스트랩 모드(첫 검사 포함)에서도
             # 양자 경로가 계산되므로, 이 분기는 정상적인 경우에는 거의
             # 발동하지 않는다 — 6개 지표가 전부 인식 실패한 것과 같은
             # 극단적 예외 상황에서만 여기로 온다.
-            st.markdown(
-                f"<div style='padding:16px;border-radius:10px;"
-                f"background-color:{style['color']}1A;"
-                f"border:2px dashed {style['color']};'>"
-                f"<span style='font-size:22px;font-weight:700;"
-                f"color:{style['color']};'>{style['emoji']} {tier}</span>"
-                f"<div style='margin-top:6px;font-size:13px;color:#555;'>"
-                f"이번 세션은 지표 인식이 원활하지 않아 양자 경로를 계산하지 "
-                f"못했습니다. AI 경로 결과만 표시합니다."
-                f"</div></div>",
-                unsafe_allow_html=True
-            )
             st.caption(
                 "⚛️ 촬영 조건(조명·각도 등)을 확인하시고 다시 측정해 보시는 것을 "
                 "권장합니다. 정상적으로 촬영되면 첫 검사부터 양자 경로도 함께 계산됩니다."
