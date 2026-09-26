@@ -2047,6 +2047,11 @@ elif st.session_state.stage == "screening":
             f"{SCREENING_SECONDS}초간 자동으로 촬영됩니다."
         )
 
+        st.caption(
+            "🗣️ 촬영이 시작되면 \"까마귀 날자 배 떨어진다\"를 또렷하게 큰 소리로 "
+            "말씀해 주세요."
+        )
+
         ctx = webrtc_streamer(
 
             key="health-screening-camera-v1",
@@ -2550,6 +2555,121 @@ elif st.session_state.stage == "report":
         # 오독될 소지가 있어 제거했다. 결과 화면의 주 정보는 위의
         # 3단계 판정(양호/주의/확인 권장)이며, 원시 참고 수치는
         # "지표별 상세 보기" expander 안에서만 확인할 수 있다.
+
+        # ========================================================
+        # [신규] 판정 기준 참고
+        # — 부트스트랩/데이터기반 모드는 계산 방식 자체가 달라(전자는
+        # risk_score 자체를 33/66으로, 후자는 combined_Z를 0.5/1.5로
+        # 구분), 두 기준을 하나의 표로 뭉뚱그리면 오해를 부른다. 그래서
+        # "지금 이 결과가 실제로 계산된 모드"의 기준만 보여준다.
+        # ========================================================
+
+        with st.expander("📐 판정 기준 참고"):
+
+            current_mode = detail.get("legacy_mode", detail.get("scored_by"))
+
+            if current_mode == "data_driven":
+                st.markdown(
+                    "**현재 결과는 데이터기반 모드로 계산되었습니다.** "
+                    "이 모드는 점수 자체가 아니라 '평소·모집단 대비 얼마나 "
+                    "벗어났는지(종합 편차지수, combined_Z)'로 3단계를 나눕니다."
+                )
+                st.markdown(
+                    "- 🟢 **양호**: combined_Z < 0.5 (참고 환산 시 약 22점 미만)\n"
+                    "- 🟡 **주의**: 0.5 ≤ combined_Z < 1.5 (참고 환산 시 약 22~53점)\n"
+                    "- 🔴 **확인 권장**: combined_Z ≥ 1.5 (참고 환산 시 약 53점 이상)"
+                )
+            else:
+                st.markdown(
+                    "**현재 결과는 부트스트랩(초기) 모드로 계산되었습니다.** "
+                    "아직 모집단 표본이 충분히 쌓이지 않아, 고정 계수로 계산한 "
+                    "참고 점수(0~100) 자체를 기준으로 3단계를 나눕니다."
+                )
+                st.markdown(
+                    "- 🟢 **양호**: 점수 < 33\n"
+                    "- 🟡 **주의**: 33 ≤ 점수 < 66\n"
+                    "- 🔴 **확인 권장**: 점수 ≥ 66"
+                )
+
+            st.caption(
+                "⚠️ 두 모드는 계산 방식 자체가 달라 점수를 서로 직접 비교할 수 "
+                "없습니다. 또한 이 경계값(33/66, 0.5/1.5)은 임상 라벨 데이터로 "
+                "검증된 진단 기준이 아니라, 현재 프로토타입 단계의 잠정 설정값입니다."
+            )
+
+        # ========================================================
+        # [신규] 참고문헌
+        # — 6개 바이오마커 각각을 '관찰 대상으로 삼는' 방향성의 근거가
+        # 된 문헌. 본 앱의 구체적 계산식·가중치·임계값을 검증한
+        # 논문이 아니라는 점을 항상 caption으로 같이 명시한다 —
+        # 그렇지 않으면 참고문헌 나열 자체가 "임상적으로 검증됨"이라는
+        # 인상을 줄 위험이 있다.
+        # ========================================================
+
+        with st.expander("📚 참고문헌"):
+
+            st.caption(
+                "아래 문헌들은 각 지표의 구체적 점수화 공식(가중치·임계값)의 "
+                "출처가 아니라, '이 신호를 관찰 대상으로 삼는다'는 방향성이 "
+                "근거하고 있는 관련 연구입니다. 본 앱의 계산식·가중치를 그대로 "
+                "검증한 임상 논문이 아니며, 본 앱은 진단 도구가 아닙니다."
+            )
+
+            st.markdown(
+                "**표정 변화 · 미세 근육 움직임**\n"
+                "- Jiang, Z. et al. (2022). Automated analysis of facial "
+                "emotions in subjects with cognitive impairment. *PLOS ONE*, "
+                "17(1), e0262527.\n"
+                "- Fei, Z. et al. (2022). A novel deep neural network-based "
+                "emotion analysis system for automatic detection of MCI in "
+                "the elderly. *Neurocomputing*, 468, 306–316.\n"
+                "- Oh, Y.-H. et al. (2018). A Survey of Automatic Facial "
+                "Micro-Expression Analysis. *Frontiers in Psychology*, 9, 1128."
+            )
+            st.markdown(
+                "**안면 비대칭**\n"
+                "- Chien, C.-F. et al. (2023). Analyzing Facial Asymmetry in "
+                "Alzheimer's Dementia Using Image-Based Technology. "
+                "*Biomedicines*, 11(10), 2802."
+            )
+            st.markdown(
+                "**눈 깜빡임 빈도**\n"
+                "- Ladas, A. et al. (2014). Eye Blink Rate as a biological "
+                "marker of Mild Cognitive Impairment. *International Journal "
+                "of Psychophysiology*, 93, 12–16.\n"
+                "- D'Antonio, F. et al. (2021). Blink Rate Study in Patients "
+                "with Alzheimer's Disease, MCI and SCD. *Current Alzheimer "
+                "Research*, 18(14).\n"
+                "- Soukupová, T., Čech, J. (2016). Real-Time Eye Blink "
+                "Detection Using Facial Landmarks. *21st Computer Vision "
+                "Winter Workshop*."
+            )
+            st.markdown(
+                "**시선 이동 변동성**\n"
+                "- Oyama, A. et al. (2019). Novel Method for Rapid Assessment "
+                "of Cognitive Impairment Using High-Performance Eye-Tracking "
+                "Technology. *Scientific Reports*, 9, 12932."
+            )
+            st.markdown(
+                "**반응속도**\n"
+                "- O'Callaghan, C. et al. (2019). Sustained attention "
+                "failures on a 3-min reaction time task is a sensitive "
+                "marker of dementia. *Journal of Neurology*, 266(6), "
+                "1323–1332.\n"
+                "- Kochan, N.A. et al. (2016). Reaction time measures "
+                "predict incident dementia. *American Journal of Geriatric "
+                "Psychiatry*, 24(3), 221–231.\n"
+                "- Phillips, M. et al. (2013). Intra-individual reaction "
+                "time variability in MCI and AD. *PLOS ONE*, 8(5), e65712."
+            )
+            st.markdown(
+                "**통합 알고리즘의 통계적 기법**\n"
+                "- Welford, B.P. (1962). Note on a method for calculating "
+                "corrected sums of squares and products. *Technometrics*, "
+                "4(3), 419–420.\n"
+                "- Efron, B., Morris, C. (1977). Stein's Paradox in "
+                "Statistics. *Scientific American*, 236(5), 119–127."
+            )
 
 
         # ========================================================
