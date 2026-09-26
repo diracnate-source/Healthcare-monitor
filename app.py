@@ -7,6 +7,7 @@ import os
 import random
 import logging
 import json
+import hashlib
 import urllib.request
 import mediapipe as mp
 from risk_model.app_py_adapter import compute_risk_score_v3
@@ -23,6 +24,33 @@ from av import VideoFrame
 
 SCREENING_SECONDS = 7
 SCREENING_MAX_FRAMES = 90  # 메모리 보호용 상한 (약 7초 * 15fps 여유분)
+
+
+# ============================================================
+# [신규] 식별자 익명화
+# — 사용자가 "이름 또는 별명" 칸에 실명을 입력하더라도, 실제로
+# population_store/baseline_store/dual_path_log 등 디스크에 저장되는
+# 값은 되돌릴 수 없는 해시값이어야 한다. "실명 대신 별명을 써달라"는
+# 안내 문구만으로는 사용자 행동에 의존하게 되어 실효성이 없으므로,
+# 안내와 무관하게 항상 자동으로 익명화되도록 만든다.
+#
+# 같은 입력값은 항상 같은 해시로 변환되므로(결정론적), 사용자가 매번
+# 똑같은 문자열을 입력하기만 하면 개인화(경험적 베이즈, 개인 분산 등)는
+# 기존과 동일하게 정상 작동한다 — 바뀌는 건 '디스크에 남는 형태'뿐이다.
+# ============================================================
+
+def anonymize_user_id(raw_text):
+    """사용자가 입력한 원문(이름/별명)을 저장용 익명 키로 변환한다.
+    앞뒤 공백 차이로 다른 사람 취급되는 것을 막기 위해 strip() 후 해시한다.
+    """
+    if not raw_text:
+        return None
+    normalized = raw_text.strip()
+    if not normalized:
+        return None
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return digest[:16]  # 16자로 잘라도 충돌 가능성은 사실상 무시할 수준
+
 
 
 # ============================================================
@@ -2290,20 +2318,31 @@ elif st.session_state.stage == "report":
         st.caption(
             "입력하면 이후 측정에서 이번 결과와 비교하고, 반복 "
             "측정이 쌓일수록 이 정보를 바탕으로 결과가 본인에게 "
-            "맞춰져요. 입력하지 않아도 결과는 확인할 수 있어요."
+            "맞춰져요. 입력하지 않아도 결과는 확인할 수 있어요.\n\n"
+            "🔒 실명 대신 본인만 아는 별명이나 코드를 권장합니다 — "
+            "다만 실명을 입력하셔도, 실제 저장되는 값은 원문이 아니라 "
+            "되돌릴 수 없는 암호화된 코드로 자동 변환되어 저장되므로 "
+            "안전합니다."
         )
 
-        user_id = st.text_input(
+        user_id_raw = st.text_input(
             "이름 또는 별명",
             key="baseline_user_id"
         )
+
+        # 화면 표시(예: "'홍길동'님의 기준선으로...")에는 사용자가
+        # 입력한 원문을 그대로 쓰되, 실제 저장/조회 키는 항상 익명화된
+        # 값을 사용한다 — 이 둘을 절대 섞어 쓰지 않도록 변수명을
+        # 분리해뒀다.
+        user_id_display = user_id_raw.strip() if user_id_raw else None
+        user_id = anonymize_user_id(user_id_raw)
 
         reaction_ms = (reaction or {}).get("reaction_ms")
 
         risk_score, raw_scores, detail, quantum_result = compute_dual_path_result(
             screening["metrics"],
             reaction_ms=reaction_ms,
-            user_id=(user_id or None)
+            user_id=user_id
         )
 
         # 모집단 통계 갱신 — 같은 세션에서 재실행(rerun)될 때마다
@@ -2787,7 +2826,7 @@ elif st.session_state.stage == "report":
                     )
 
                     st.success(
-                        f"'{user_id}'님의 기준선으로 저장했어요. "
+                        f"'{user_id_display}'님의 기준선으로 저장했어요. "
                         f"다음 검사부터 이 결과와 비교해서 보여드릴게요."
                     )
 
