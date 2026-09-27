@@ -55,6 +55,40 @@ METRIC_WEIGHTS = {
     "reaction_ms": 1.0,
 }
 
+# [2026-09-26 추가, 중요] 어느 방향의 편차를 "위험 신호"로 볼지 지표별로
+# 다르게 설정한다. 실사용자가 '무표정하고 움직임이 적은' 인지장애 연기를
+# 해봤더니 오히려 더 낮은(더 "양호"한) 점수가 나오는 문제가 실측으로
+# 발견됐다 — 원인은 기존 코드가 6개 지표 전부에 "평소보다 값이 높아지는
+# 것만 위험"이라는 단측(one-sided) z-score(z_plus = max(0, z))를 똑같이
+# 적용하고 있었기 때문이다. 이 가정은 지표마다 문헌적 근거가 다르다.
+#
+#   True(단측, 높을수록만 위험):
+#     - facial_asymmetry: 비대칭이 클수록 위험 (생리학적으로 타당,
+#       Chien et al. 2023)
+#     - gaze_variability: 시선이 더 불규칙할수록 위험 (Oyama et al. 2019)
+#     - reaction_ms: 반응이 느릴수록(값이 클수록) 위험 (O'Callaghan 2019,
+#       Kochan 2016, Phillips 2013 — 방향성 근거가 가장 확실한 지표)
+#
+#   False(양측, 평소보다 많이 높아져도 많이 낮아져도 둘 다 위험):
+#     - expression_change: 표정 변화가 지나치게 적은 것(무표정/flat affect)도
+#       임상적으로 알려진 위험 신호이며, 지나치게 큰 것만 위험하다고 볼
+#       근거가 없다
+#     - micro_movement: 움직임이 지나치게 적어지는 것도 위험 신호일 수 있음
+#     - blink_rate: 문헌상 방향성이 일관되지 않음(늘어난다는 연구도,
+#       줄어든다는 연구도 있음, Ladas 2014 / D'Antonio 2021) — 한쪽
+#       방향만 위험하다고 가정할 근거가 없다
+#
+# 근거가 불확실한 지표는 "양측"으로 두는 것이 "단측으로 잘못 가정해서
+# 절반의 위험 신호를 아예 놓치는 것"보다 안전하다.
+ONE_SIDED_METRICS = {
+    "expression_change": False,
+    "micro_movement": False,
+    "facial_asymmetry": True,
+    "blink_rate": False,
+    "gaze_variability": True,
+    "reaction_ms": True,
+}
+
 METRIC_NAMES = (
     "expression_change",
     "micro_movement",
@@ -277,7 +311,15 @@ def data_driven_score(
             sigma_ref = pop.std
 
         z = (x - mu_ref) / sigma_ref
-        z_plus = max(0.0, z)
+
+        # [2026-09-26 수정] 지표별로 단측/양측을 구분해서 적용한다.
+        # 이전에는 max(0.0, z)만 썼는데, 이러면 방향성이 불확실한
+        # 지표(표정 변화·미세 움직임·눈 깜빡임)에서 '평소보다 낮은 쪽'의
+        # 위험 신호를 전부 0으로 지워버리는 문제가 있었다.
+        if ONE_SIDED_METRICS.get(name, True):
+            z_plus = max(0.0, z)
+        else:
+            z_plus = abs(z)
 
         weight = METRIC_WEIGHTS[name]
         weighted_z_sum += weight * z_plus
