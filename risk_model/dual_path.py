@@ -21,10 +21,14 @@ quantum_optimizer.compute_quantum_optimized_score()가 산출하는 양자
 - 화면에 노출되는 '공식' 판정은 항상 AI 경로(compute_risk_score_v3)의
   결과다. 양자 경로는 이 함수를 통해 계산되고 로그에 남더라도, 그
   자체로 최종 판정에 관여하지 않는다.
-- 양자 경로는 데이터기반 모드(z_plus_by_metric이 채워진 경우)에서만
-  계산 가능하다. 부트스트랩 모드에서는 z-score 자체가 없어 QAOA
-  입력을 만들 수 없으므로 quantum_result가 None으로 남는다 — 이것도
-  로그에 정직하게 기록된다(가짜 값을 채우지 않는다).
+- 양자 경로는 부트스트랩 모드에서도 계산된다 (2026-09-15 수정) —
+  bootstrap_score()가 반환하는 클리핑된 원시값(raw_clipped)을
+  z_plus_by_metric으로 대신 채워 넣어, 표본이 전혀 없는 첫 검사부터도
+  양자 경로가 동작하도록 만들었다. quantum_optimizer.compute_
+  quantum_optimized_score()에 mode="bootstrap"을 넘기면, 그에 맞는
+  선형 스케일 결합공식(지수 스쿼싱이 아님)을 쓴다. z_plus_by_metric
+  자체가 완전히 비어 있는 경우(6개 지표 전부 랜드마크 인식 실패 등
+  극단적 예외)에만 quantum_result가 None으로 남는다.
 """
 
 from __future__ import annotations
@@ -111,6 +115,8 @@ def compute_dual_path_result(
             "boosted_metrics": q.boosted_metrics,
             "effective_weights": q.effective_weights,
             "qaoa_matched_true_optimum": q.qaoa_result.qaoa_matched_true_optimum,
+            "qaoa_raw_energy": q.qaoa_result.qaoa_raw_energy,
+            "true_optimum_energy": q.qaoa_result.true_optimum_energy,
             "top_bitstring_probability": q.qaoa_result.top_bitstring_probability,
             "k_target": QUANTUM_K_TARGET,
             "penalty": QUANTUM_PENALTY,
@@ -151,6 +157,15 @@ def _log_dual_path_result(
         "quantum_risk_score": quantum_result["risk_score"] if quantum_result else None,
         "quantum_tier": quantum_result["tier"] if quantum_result else None,
         "quantum_boosted_metrics": quantum_result["boosted_metrics"] if quantum_result else None,
+        # [2026-09-27 추가] 이전에는 quantum_result 딕셔너리 안에만
+        # 존재하고 실제 로그 파일에는 기록되지 않던 필드들 — 도면
+        # 설명(170: "정답/match 기록")과 실제 로그가 어긋난다는 점이
+        # 문서 대조로 지적되어 추가한다. 이제 세션마다 QAOA가 스스로
+        # 진짜 최적해를 찾았는지, 그 에너지 값이 전수탐색 최적값과
+        # 얼마나 일치했는지가 로그에 그대로 남는다.
+        "qaoa_matched_true_optimum": quantum_result["qaoa_matched_true_optimum"] if quantum_result else None,
+        "qaoa_raw_energy": quantum_result.get("qaoa_raw_energy") if quantum_result else None,
+        "true_optimum_energy": quantum_result.get("true_optimum_energy") if quantum_result else None,
         # 두 경로가 같은 3단계 판정에 도달했는지 — 라벨 없이도 지금 당장
         # 확인 가능한 '경로 간 일치율' 지표. 일치율 자체가 예측력을
         # 뜻하진 않지만, 두 경로가 얼마나 자주/어떤 조건에서 갈리는지는

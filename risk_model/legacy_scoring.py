@@ -256,7 +256,13 @@ def bootstrap_score(metrics: Dict[str, Optional[float]]) -> Dict:
 
 
 def _tier_from_score(risk_score: float) -> str:
-    if risk_score < 33:
+    # [2026-09-27 수정] 선별검사는 "위험을 놓치는 것"(위음성)이
+    # "괜찮은 사람에게 확인을 권하는 것"(위양성)보다 훨씬 더 나쁜
+    # 실수이므로, "양호" 판정 범위를 기존 33점보다 보수적으로
+    # 좁혔다. 다만 이 25라는 값 자체도 33과 마찬가지로 임상
+    # 라벨 데이터로 검증된 기준은 아니며, 방향성(더 엄격하게)만
+    # 반영한 잠정값이다.
+    if risk_score < 25:
         return "양호"
     if risk_score < 66:
         return "주의"

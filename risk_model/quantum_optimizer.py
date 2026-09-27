@@ -55,7 +55,7 @@ from qiskit import QuantumCircuit
 from qiskit.quantum_info import Statevector
 from scipy.optimize import minimize
 
-from .legacy_scoring import METRIC_NAMES, METRIC_WEIGHTS, SQUASH_LAMBDA, _tier_from_score
+from .legacy_scoring import METRIC_NAMES, METRIC_WEIGHTS, SQUASH_LAMBDA, _tier_from_score, _tier_from_z
 
 N_QUBITS = len(METRIC_NAMES)  # 6
 
@@ -374,11 +374,18 @@ def compute_quantum_optimized_score(
     weighted_sum = 0.0
     weight_total = 0.0
     for m in METRIC_NAMES:
+        # [2026-09-27 수정, B-3] 이전에는 결측 지표를 z_plus_by_metric.get(m, 0.0)
+        # 으로 0.0 취급하면서도 weight_total에는 그대로 더해, legacy 경로(결측
+        # 지표를 분모에서 아예 제외)와 다르게 분모만 희석시키는 불일치가 있었다.
+        # 이제 z_plus_by_metric에 아예 없는(결측) 지표는 legacy와 동일하게
+        # 분자·분모 양쪽에서 완전히 제외한다.
+        if m not in z_plus_by_metric:
+            continue
         base_w = base_weights[m]
         factor = boost_factor if m in boosted else BASE_FACTOR
         w = base_w * factor
         effective_weights[m] = w
-        weighted_sum += w * z_plus_by_metric.get(m, 0.0)
+        weighted_sum += w * z_plus_by_metric[m]
         weight_total += w
 
     combined_value = weighted_sum / weight_total if weight_total > 0 else 0.0
@@ -386,14 +393,23 @@ def compute_quantum_optimized_score(
     if mode == "bootstrap":
         # bootstrap_score()와 동일한 최종 변환: 단순 선형 스케일 + 클립
         risk_score = float(max(0.0, min(100.0, combined_value * 1.2)))
+        tier = _tier_from_score(risk_score)
     else:
         # data_driven_score()와 동일한 최종 변환: 지수 스쿼싱
         risk_score = 100.0 * (1.0 - np.exp(-combined_value / SQUASH_LAMBDA))
         risk_score = float(max(0.0, min(100.0, risk_score)))
+        # [2026-09-27 수정, B-2] legacy(data_driven_score)는 등급을
+        # risk_score(점수, 33/66 기준)가 아니라 combined_Z(0.5/1.5 기준)로
+        # 정한다. 여기서 계속 _tier_from_score를 쓰면, 같은 combined_Z라도
+        # legacy 경로와 양자 경로가 서로 다른 등급을 받는 불일치가 생긴다
+        # (예: combined_Z=1.6 -> legacy는 "확인 권장", 환산 점수 55.3에
+        # _tier_from_score를 적용하면 "주의"). data_driven 모드에서는
+        # legacy와 완전히 같은 기준(_tier_from_z)을 쓰도록 통일한다.
+        tier = _tier_from_z(combined_value)
 
     return QuantumOptimizedScore(
         risk_score=risk_score,
-        tier=_tier_from_score(risk_score),
+        tier=tier,
         combined_z=combined_value,
         boosted_metrics=list(boosted),
         effective_weights=effective_weights,

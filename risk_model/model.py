@@ -218,7 +218,11 @@ def score_with_fallback(
 
 
 def _tier_from_score(risk_score: float) -> str:
-    if risk_score < 33:
+    # [2026-09-27 수정] legacy_scoring.py의 동일 함수와 기준을 맞춤
+    # (33 -> 25) — 이 두 함수가 서로 다른 파일에 독립적으로 중복
+    # 정의돼 있어, 한쪽만 고치면 또 불일치가 생길 수 있다는 점을
+    # 발견했다. 나중에 하나를 공용 함수로 합치는 정리가 필요하다.
+    if risk_score < 25:
         return "양호"
     if risk_score < 66:
         return "주의"

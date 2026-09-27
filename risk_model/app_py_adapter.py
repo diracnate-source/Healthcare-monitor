@@ -107,14 +107,19 @@ def convert_app_personal_store(
 ) -> Dict[str, PersonalStats]:
     """baseline_store.json의 특정 user_id 항목 -> {지표명: PersonalStats}.
 
-    원본 app.py는 지표별로 세션 수를 따로 세지 않고 n_sessions 하나를
-    모든 지표가 공유한다(get_personal_stats). 그 동작을 그대로 재현한다:
-    - n_personal = entry["n_sessions"] (모든 지표 공통)
+    [2026-09-27 수정, B-4] 이전에는 모든 지표가 n_sessions 하나를
+    공유해서, 결측이 잦은 지표는 실제 관측 횟수보다 부풀려진 n으로
+    개인화가 이뤄지는 문제가 있었다(app.py의 save_baseline() 참고).
+    이제 지표별 실제 관측 횟수(metric_n)를 따로 읽어와, 그 지표가
+    정말 몇 번 관측됐는지에 맞춰 개인화 강도(EB 가중치)가 정해지도록
+    고쳤다.
+    - n_personal = entry["metric_n"][지표] (지표별로 다를 수 있음).
+      metric_n 자체가 없는 옛 저장분은 n_sessions로 대체(하위 호환).
     - mean = entry["metric_means"][지표] 가 있으면 그 값,
       없으면(그 지표가 한 번도 유효하게 기록된 적 없으면) 모집단 평균으로
       대체 — 이렇게 하면 EB 결합 시 mu_ref가 그냥 모집단 평균으로
       수렴해 원본과 동일하게 동작한다.
-    - [개선] m2 = entry["metric_m2"][지표]가 있으면 그 값(없으면 0.0).
+    - m2 = entry["metric_m2"][지표]가 있으면 그 값(없으면 0.0).
       m2가 0.0이면 PersonalStats.std가 0.0이 되어, legacy_scoring의
       데이터기반 모드는 자동으로 '개인 분산 미신뢰' 경로로 폴백한다
       (population 표준편차 그대로 사용) — 즉 metric_m2가 없는 예전
@@ -131,13 +136,16 @@ def convert_app_personal_store(
     n_sessions = int(entry.get("n_sessions", 0)) if entry else 0
     metric_means = entry.get("metric_means", {}) if entry else {}
     metric_m2 = entry.get("metric_m2", {}) if entry else {}
+    # 하위 호환: metric_n이 없는 옛 저장분은 n_sessions로 대체
+    metric_n = entry.get("metric_n", {}) if entry else {}
 
     for name in METRIC_NAMES:
         pop = population_stats.get(name)
         fallback_mean = pop.mean if pop is not None else 0.0
         mean = float(metric_means.get(name, fallback_mean))
         m2 = float(metric_m2.get(name, 0.0))
-        result[name] = PersonalStats(n_personal=n_sessions, mean=mean, m2=m2)
+        n_personal = int(metric_n.get(name, n_sessions))
+        result[name] = PersonalStats(n_personal=n_personal, mean=mean, m2=m2)
 
     return result
 
