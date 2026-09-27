@@ -1014,7 +1014,26 @@ RIGHT_MOUTH_IDX = 291
 LEFT_BROW_IDX = 105
 RIGHT_BROW_IDX = 334
 
+# [신규] 입을 벌리는 정도(위아래) 측정용 — 기존 LEFT/RIGHT_MOUTH_IDX는
+# 입꼬리(좌우 비대칭)만 측정하고, 입을 벌렸는지(발화 여부)는 별도
+# 랜드마크가 필요하다. 표준 MediaPipe Face Mesh 기준 윗입술/아랫입술
+# 안쪽 중앙점.
+UPPER_LIP_IDX = 13
+LOWER_LIP_IDX = 14
+
+# 얼굴 크기·카메라 거리에 따라 입 벌림 절대값이 달라지므로, 표정과
+# 무관하게 비교적 일정한 눈 사이 거리(양쪽 눈 바깥쪽 끝)로 나눠
+# 정규화한다. 이미 EAR 계산에 쓰는 인덱스를 그대로 재사용한다.
+LEFT_EYE_OUTER_IDX = 33
+RIGHT_EYE_OUTER_IDX = 263
+
 EAR_BLINK_THRESHOLD = 0.21  # 이 값 아래로 내려가면 "눈 감음"으로 판정
+
+# 7초 동안 (정규화된) 입 벌림 정도의 최대-최소 폭이 이 값 미만이면,
+# "속담을 소리 내어 말해달라"는 지시를 사실상 따르지 않은 것으로
+# 본다. 실제 발화 시 입 벌림 폭은 이 값보다 뚜렷하게 크게 나타난다는
+# 것을 전제로 한 잠정 임계값이며, 임상적으로 검증된 기준이 아니다.
+MOUTH_MOVEMENT_COMPLIANCE_THRESHOLD = 0.03
 
 
 def _eye_aspect_ratio(pts, idx):
@@ -1047,6 +1066,7 @@ def generate_landmark_visualization_and_metrics(frames):
     ear_series = []
     asymmetry_series = []
     gaze_x_series = []
+    mouth_opening_series = []  # [신규] 발화 과제 수행 여부 확인용
 
     prev_pts = None
     has_iris = None  # 첫 검출 시 478점 여부 확인
@@ -1097,6 +1117,17 @@ def generate_landmark_visualization_and_metrics(frames):
         )
 
         asymmetry_series.append((mouth_asym + brow_asym) / 2.0)
+
+        # --- [신규] 입 벌림 정도 (발화 과제 수행 여부 확인용) ---
+        # 눈 사이 거리로 정규화해 얼굴 크기·카메라 거리 영향을 줄인다.
+        face_scale = np.linalg.norm(
+            pts[LEFT_EYE_OUTER_IDX] - pts[RIGHT_EYE_OUTER_IDX]
+        )
+        if face_scale > 1e-6:
+            mouth_opening = np.linalg.norm(
+                pts[UPPER_LIP_IDX] - pts[LOWER_LIP_IDX]
+            )
+            mouth_opening_series.append(float(mouth_opening / face_scale))
 
         # --- 시선 이동 (iris가 있을 때만) ---
         if has_iris:
@@ -1156,6 +1187,24 @@ def generate_landmark_visualization_and_metrics(frames):
     else:
         gaze_variability = None  # iris 미검출 시 측정 불가
 
+    # --- [신규] 발화 과제(속담 소리 내어 말하기) 수행 여부 추정 ---
+    # 이 시스템은 마이크로 소리를 녹음·검증하지 않는다. 대신 이미
+    # 갖고 있는 얼굴 랜드마크만으로, 7초 동안 입이 실제로 벌어졌다
+    # 오므려졌다 했는지(=입 벌림 정도의 변동폭)를 보고 간접적으로
+    # 추정한다. 이 값은 위험도 점수 계산에는 전혀 쓰이지 않고, 오직
+    # "과제를 제대로 수행했는지"를 사용자에게 알려주기 위한 데이터
+    # 품질 지표로만 쓰인다 — 안 그러면 지시를 따르지 않아 입을 거의
+    # 안 움직인 사람이, 표정 변화가 적다는 이유로 오히려 더 "양호"로
+    # 잘못 판정될 위험이 있다(실제로 사용자가 지적해 발견한 문제).
+    if len(mouth_opening_series) >= 2:
+        mouth_movement_range = float(
+            max(mouth_opening_series) - min(mouth_opening_series)
+        )
+        speech_task_detected = mouth_movement_range >= MOUTH_MOVEMENT_COMPLIANCE_THRESHOLD
+    else:
+        mouth_movement_range = None
+        speech_task_detected = None  # 판단 불가(랜드마크 검출 자체가 부족)
+
     metrics = {
         "expression_change": expression_change,
         "micro_movement": micro_movement,
@@ -1163,6 +1212,8 @@ def generate_landmark_visualization_and_metrics(frames):
         "blink_rate": blink_rate,
         "gaze_variability": gaze_variability,
         "iris_available": bool(has_iris),
+        "mouth_movement_range": mouth_movement_range,
+        "speech_task_detected": speech_task_detected,
     }
 
     return annotated_rgb, metrics, face_detected
@@ -2360,6 +2411,32 @@ elif st.session_state.stage == "report":
             "등)와 궤를 같이 하지만, 이 화면의 구체적 점수·가중치는 "
             "임상적으로 검증되지 않은 프로토타입 계산값입니다."
         )
+
+        # ========================================================
+        # [신규] 발화 과제 수행 여부 확인
+        # — 이 시스템은 마이크로 소리를 녹음·검증하지 않으므로,
+        # "속담을 소리 내어 말씀해 주세요"라는 지시를 실제로
+        # 따랐는지는 얼굴 랜드마크(입 벌림 변동폭)로만 간접 추정한다.
+        # speech_task_detected가 False면, 표정 변화가 적어 보이는 게
+        # '양호'해서가 아니라 '과제를 안 해서'일 수 있다는 것을 결과
+        # 판정보다 먼저 명확히 알린다 — 조용히 넘어가면 지시를 안 따른
+        # 사람이 오히려 더 좋은 결과로 오판될 위험이 있기 때문이다.
+        # ========================================================
+        speech_task_detected = screening["metrics"].get("speech_task_detected")
+
+        if speech_task_detected is False:
+            st.warning(
+                "🗣️ 촬영 중 입 움직임이 거의 감지되지 않았습니다. "
+                "\"까마귀 날자 배 떨어진다\"를 소리 내어 말씀하지 않으셨을 "
+                "가능성이 있습니다. 아래 결과는 표정 변화가 실제보다 적게 "
+                "측정되었을 수 있어 신뢰도가 낮습니다 — 다시 한 번 측정해 "
+                "보시는 것을 권장합니다."
+            )
+        elif speech_task_detected is None:
+            st.caption(
+                "ℹ️ 발화 과제(속담 소리 내어 말하기) 수행 여부는 이번 "
+                "촬영에서 판단할 만한 데이터가 부족해 확인하지 못했습니다."
+            )
 
         TIER_STYLE = {
             "양호":       {"color": "#2E7D32", "emoji": "🟢"},
