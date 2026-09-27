@@ -1315,8 +1315,12 @@ TIER_THRESHOLDS = {
 }
 
 # 3단계 완충 라벨 임계값 (레거시 부트스트랩 모드, 0~100 스코어 기준)
+# [2026-09-27 수정] 33 -> 25 (선별검사는 위험을 놓치는 것이 더 나쁜
+# 실수이므로 "양호" 범위를 보수적으로 좁힘). 참고: 이 상수를 쓰는
+# compute_risk_score()는 현재 어디서도 호출되지 않는 사용 안 하는
+# 함수이지만, 혼란 방지를 위해 값은 맞춰둔다.
 LEGACY_TIER_THRESHOLDS = {
-    "양호": 33.0,
+    "양호": 25.0,
     "주의": 66.0,
     # 그 이상은 "확인 권장"
 }
@@ -1490,6 +1494,15 @@ def save_baseline(user_id, metrics, risk_score, reaction_ms=None):
     8회 이상 누적 시). 이 값이 없으면 risk_model.app_py_adapter가
     항상 모집단 표준편차로 폴백하므로, 이 저장 로직도 함께 갱신해야
     실제로 개인화된 분산이 반영된다.
+
+    [2026-09-27 수정, B-4] 이전에는 모든 지표가 공유하는 n_sessions
+    하나로 Welford n을 갱신했다. 예를 들어 홍채 미검출로
+    gaze_variability가 3번 결측된 사용자라면, 실제로는 이 지표를
+    2번밖에 관측 못 했는데도 n_sessions(예: 5)를 그대로 써서
+    "5번째 관측"인 것처럼 평균을 갱신해버려, 새 관측치의 반영 비중이
+    실제보다 과소평가됐다. 이제 지표별로 각자 실제 관측 횟수
+    (metric_n)를 따로 추적해서, 그 지표가 결측 없이 실제로 몇 번
+    관측됐는지에 맞춰 정확하게 Welford를 갱신한다.
     """
 
     values = {
@@ -1504,32 +1517,43 @@ def save_baseline(user_id, metrics, risk_score, reaction_ms=None):
     with _baseline_lock:
 
         store = _load_json_store(BASELINE_STORE_PATH, threading.Lock())
-        entry = store.get(user_id, {"n_sessions": 0, "metric_means": {}, "metric_m2": {}})
+        entry = store.get(user_id, {
+            "n_sessions": 0, "metric_means": {}, "metric_m2": {}, "metric_n": {}
+        })
 
         n_prev = entry.get("n_sessions", 0)
         means = dict(entry.get("metric_means", {}))
         m2s = dict(entry.get("metric_m2", {}))
+        # 하위 호환: metric_n이 없던 옛 저장분은, 그때까지 저장된
+        # metric_means에 값이 있었다면 일단 n_sessions와 동일했다고
+        # 간주하고 시작한다(완전히 정확하진 않지만, 없던 것보다는
+        # 훨씬 낫고 이후로는 지표별로 정확히 갈라진다).
+        metric_n = dict(entry.get("metric_n", {
+            k: n_prev for k in means.keys()
+        }))
 
         for key, x in values.items():
             if x is None:
                 continue
             prev_mean = means.get(key, x)
             prev_m2 = m2s.get(key, 0.0)
-            n_new = n_prev + 1
+            n_new = metric_n.get(key, 0) + 1
             # Welford 온라인 갱신 — 평균과 분산(m2)을 함께 누적
             delta = x - prev_mean
             new_mean = prev_mean + delta / n_new
             delta2 = x - new_mean
             means[key] = new_mean
             m2s[key] = prev_m2 + delta * delta2
+            metric_n[key] = n_new
 
         store[user_id] = {
             "metrics": metrics,              # 최근 1회 측정치(표시용)
             "risk_score": risk_score,        # 최근 1회 스코어(표시용)
             "saved_at": time.strftime("%Y-%m-%d %H:%M"),
-            "n_sessions": n_prev + 1,
+            "n_sessions": n_prev + 1,         # 표시·personal_confidence용 전체 세션 수
             "metric_means": means,
             "metric_m2": m2s,
+            "metric_n": metric_n,            # 지표별 실제 관측 횟수(Welford n)
         }
 
         with open(BASELINE_STORE_PATH, "w", encoding="utf-8") as f:
@@ -2717,8 +2741,8 @@ elif st.session_state.stage == "report":
                     "참고 점수(0~100) 자체를 기준으로 3단계를 나눕니다."
                 )
                 st.markdown(
-                    "- 🟢 **양호**: 점수 < 33\n"
-                    "- 🟡 **주의**: 33 ≤ 점수 < 66\n"
+                    "- 🟢 **양호**: 점수 < 25\n"
+                    "- 🟡 **주의**: 25 ≤ 점수 < 66\n"
                     "- 🔴 **확인 권장**: 점수 ≥ 66"
                 )
 
