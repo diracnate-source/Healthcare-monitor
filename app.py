@@ -1,0 +1,3527 @@
+import streamlit as st
+import cv2
+import numpy as np
+import threading
+import time
+import os
+import random
+import logging
+import json
+import hashlib
+import urllib.request
+import mediapipe as mp
+from risk_model.app_py_adapter import compute_risk_score_v3
+from risk_model.dual_path import compute_dual_path_result
+from reaction_timer_component import reaction_timer_component
+from cognitive_tasks_component import cognitive_tasks_component
+from voice_timing_component import voice_timing_component
+from cognitive_tasks_b_component import cognitive_tasks_b_component
+from collections import deque
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
+from av import VideoFrame
+
+
+# ============================================================
+# 선별검사(SCREENING) 설정
+# ============================================================
+
+SCREENING_SECONDS = 15
+# 메모리 보호용 상한. frameRate 설정(ideal=15fps)을 기준으로
+# 15초 x 15fps = 225장이 '이상적인 경우'에 필요한 최소치이므로,
+# 이보다 적게 잡으면 시간이 다 되기도 전에 촬영이 먼저 끊긴다.
+# 약간의 여유를 둔 230으로 설정 (약 480x360 해상도 기준 프레임당
+# ~0.5MB로 계산 시, 최대 시나리오에서 메모리 사용량은 약 115MB 수준).
+SCREENING_MAX_FRAMES = 230
+
+
+# ============================================================
+# [신규] 식별자 익명화
+# — 사용자가 "이름 또는 별명" 칸에 실명을 입력하더라도, 실제로
+# population_store/baseline_store/dual_path_log 등 디스크에 저장되는
+# 값은 되돌릴 수 없는 해시값이어야 한다. "실명 대신 별명을 써달라"는
+# 안내 문구만으로는 사용자 행동에 의존하게 되어 실효성이 없으므로,
+# 안내와 무관하게 항상 자동으로 익명화되도록 만든다.
+#
+# 같은 입력값은 항상 같은 해시로 변환되므로(결정론적), 사용자가 매번
+# 똑같은 문자열을 입력하기만 하면 개인화(경험적 베이즈, 개인 분산 등)는
+# 기존과 동일하게 정상 작동한다 — 바뀌는 건 '디스크에 남는 형태'뿐이다.
+# ============================================================
+
+def anonymize_user_id(raw_text):
+    """사용자가 입력한 원문(이름/별명)을 저장용 익명 키로 변환한다.
+    앞뒤 공백 차이로 다른 사람 취급되는 것을 막기 위해 strip() 후 해시한다.
+    """
+    if not raw_text:
+        return None
+    normalized = raw_text.strip()
+    if not normalized:
+        return None
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return digest[:16]  # 16자로 잘라도 충돌 가능성은 사실상 무시할 수준
+
+
+
+# ============================================================
+# WebRTC 연결 설정
+#
+# Streamlit Community Cloud는 WebRTC 패킷(UDP)이 막히는 대표적인
+# 환경이라, STUN만으로는 연결이 되지 않는 경우가 많다
+# (streamlit-webrtc 공식 문서에 명시된 내용).
+# 무료 공용 TURN(Open Relay)은 공식 문서에서도 "불안정하고 자주
+# 다운된다"고 경고하므로, Twilio의 TURN 발급 API를 우선 사용하고,
+# 설정이 안 되어 있으면 STUN만으로 폴백한다.
+# ============================================================
+
+@st.cache_resource(ttl=3600 * 20, show_spinner=False)
+def _get_ice_servers_from_metered():
+
+    app_name = st.secrets["METERED_APP_NAME"]
+    api_key = st.secrets["METERED_API_KEY"]
+
+    url = (
+        f"https://{app_name}.metered.live/api/v1/turn/credentials"
+        f"?apiKey={api_key}"
+    )
+
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    return data
+
+
+def _get_ice_servers_from_twilio():
+
+    from twilio.rest import Client
+
+    account_sid = st.secrets["TWILIO_ACCOUNT_SID"]
+    auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
+
+    client = Client(account_sid, auth_token)
+    token = client.tokens.create()
+
+    return token.ice_servers
+
+
+def get_ice_servers():
+
+    # 1순위: Metered.ca 개인 계정 (안정적, 무료 500MB/월)
+    try:
+
+        servers = _get_ice_servers_from_metered()
+
+        print(f"[TURN] Metered.ca ICE 서버 발급 성공: {len(servers)}개")
+
+        return servers, None
+
+    except Exception as e_metered:
+
+        metered_error = f"Metered: {type(e_metered).__name__}: {e_metered}"
+        print(f"[TURN] Metered.ca 발급 실패: {metered_error}")
+
+        # 2순위: Twilio (계정이 유료 전환되어 있다면 시도)
+        try:
+
+            servers = _get_ice_servers_from_twilio()
+
+            print(f"[TURN] Twilio ICE 서버 발급 성공: {len(servers)}개")
+
+            return servers, None
+
+        except Exception as e_twilio:
+
+            twilio_error = f"Twilio: {type(e_twilio).__name__}: {e_twilio}"
+            print(f"[TURN] Twilio 발급도 실패: {twilio_error}")
+
+            # 최종 폴백: STUN만 사용 (일부 환경에서 연결 불안정 가능)
+            combined_error = f"{metered_error} / {twilio_error}"
+
+            return (
+                [{"urls": ["stun:stun.l.google.com:19302"]}],
+                combined_error
+            )
+
+
+_ice_servers, _ice_error = get_ice_servers()
+
+RTC_CONFIGURATION = {
+    "iceServers": _ice_servers
+}
+
+if _ice_error and st.session_state.get("show_turn_debug", True):
+    st.warning(
+        f"⚠️ TURN 서버(Twilio) 연결 실패로 STUN만 사용 중입니다. "
+        f"연결이 불안정할 수 있어요.\n\n디버그 정보: {_ice_error}"
+    )
+
+# aioice/aiortc의 시끄러운 INFO 로그(연결 종료 후 재시도 등)를 줄인다.
+logging.getLogger("aioice").setLevel(logging.ERROR)
+logging.getLogger("aiortc").setLevel(logging.ERROR)
+
+
+# ============================================================
+# 기본 설정
+# ============================================================
+
+st.set_page_config(
+    page_title="AI 비접촉 선별검사 시스템",
+    page_icon="🧠",
+    layout="centered"
+)
+
+
+# ============================================================
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+
+    .title {
+        text-align: center;
+        font-size: 32px;
+        font-weight: 800;
+        margin-bottom: 5px;
+    }
+
+    .subtitle {
+        text-align: center;
+        color: #666;
+        margin-bottom: 20px;
+    }
+
+    .pass {
+        background: #e9fff1;
+        border: 3px solid #00c853;
+        color: #00863d;
+        border-radius: 14px;
+        padding: 18px;
+        text-align: center;
+        font-size: 24px;
+        font-weight: 800;
+        margin: 15px 0;
+    }
+
+    .fail {
+        background: #fff0f0;
+        border: 3px solid #ff3030;
+        color: #d00000;
+        border-radius: 14px;
+        padding: 18px;
+        text-align: center;
+        font-size: 24px;
+        font-weight: 800;
+        margin: 15px 0;
+    }
+
+    .checking {
+        background: #fff8df;
+        border: 3px solid #ffb300;
+        color: #946500;
+        border-radius: 14px;
+        padding: 18px;
+        text-align: center;
+        font-size: 22px;
+        font-weight: 800;
+        margin: 15px 0;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# 제목
+# ============================================================
+
+st.markdown(
+    '<div class="title">🧠 AI 비접촉 선별검사 시스템</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="subtitle">촬영 전 얼굴 및 촬영 조건 자동 검사</div>',
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "stage" not in st.session_state:
+    st.session_state.stage = "precheck"
+
+if "processor" not in st.session_state:
+    st.session_state.processor = None
+
+if "transitioning" not in st.session_state:
+    st.session_state.transitioning = False
+
+if "screening_processor" not in st.session_state:
+    st.session_state.screening_processor = None
+
+if "screening_result" not in st.session_state:
+    st.session_state.screening_result = None
+
+if "reaction_result" not in st.session_state:
+    st.session_state.reaction_result = None
+
+if "reaction_attempt" not in st.session_state:
+    st.session_state.reaction_attempt = 0
+
+if "reaction_target_delay_ms" not in st.session_state:
+    st.session_state.reaction_target_delay_ms = None
+
+if "cog_task_run" not in st.session_state:
+    st.session_state.cog_task_run = 0
+
+if "cog_a" not in st.session_state:
+    st.session_state.cog_a = None
+
+if "voice_result" not in st.session_state:
+    st.session_state.voice_result = None
+
+if "voice_wait_start" not in st.session_state:
+    st.session_state.voice_wait_start = None
+
+if "task_camera_processor" not in st.session_state:
+    st.session_state.task_camera_processor = None
+
+if "population_recorded" not in st.session_state:
+    st.session_state.population_recorded = False
+
+
+# ============================================================
+# 초기화
+# ============================================================
+
+def reset_app():
+
+    st.session_state.stage = "precheck"
+    st.session_state.processor = None
+    st.session_state.transitioning = False
+    st.session_state.screening_processor = None
+    st.session_state.screening_result = None
+    st.session_state.reaction_result = None
+    st.session_state.reaction_attempt = 0
+    st.session_state.reaction_target_delay_ms = None
+    # 인지과제 컴포넌트 key를 바꿔야 다시 시작할 때 이전 완료값이 남지 않는다
+    st.session_state.cog_task_run += 1
+    st.session_state.cog_a = None
+    st.session_state.voice_result = None
+    st.session_state.voice_wait_start = None
+    st.session_state.task_camera_processor = None
+    st.session_state.population_recorded = False
+
+
+# ============================================================
+# OpenCV 모델
+#
+# 방어 로직:
+# 배포 환경(Streamlit Cloud 등)에서 numpy/opencv 버전 충돌이나
+# 시스템 라이브러리 누락으로 cv2.data 자체가 없는 경우가 있다.
+# 이 경우 원인을 화면에 명확히 표시하고 앱을 중단시킨다.
+# ============================================================
+
+if not hasattr(cv2, "data"):
+
+    st.error(
+        "OpenCV 모듈이 정상적으로 로드되지 않았습니다 "
+        "(cv2.data 속성 없음).\n\n"
+        f"설치된 OpenCV 버전: {getattr(cv2, '__version__', '알 수 없음')}\n\n"
+        "requirements.txt의 numpy / opencv-python-headless 버전이 "
+        "서로 호환되는지 확인하고, packages.txt에 시스템 라이브러리"
+        "(libgl1, libglib2.0-0)가 포함되어 있는지 확인한 뒤 "
+        "앱을 재배포(reboot)해 주세요."
+    )
+    st.stop()
+
+
+FACE_XML = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+EYE_XML = cv2.data.haarcascades + "haarcascade_eye.xml"
+GLASSES_XML = cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+
+
+try:
+    face_cascade = cv2.CascadeClassifier(FACE_XML)
+    eye_cascade = cv2.CascadeClassifier(EYE_XML)
+    glasses_cascade = cv2.CascadeClassifier(GLASSES_XML)
+except Exception as e:
+    st.error(f"Haar Cascade 모델 로드 중 오류가 발생했습니다: {e}")
+    st.stop()
+
+
+if face_cascade.empty():
+    st.error(
+        "얼굴 검출 모델을 불러오지 못했습니다. "
+        f"(경로: {FACE_XML})\n\n"
+        "opencv-python-headless 설치가 손상되었을 수 있습니다. "
+        "'Manage app' → 'Reboot app'으로 재배포해 보세요."
+    )
+    st.stop()
+
+
+# ============================================================
+# 안경 검출 (단일 프레임 raw 신호)
+#
+# 변경점:
+# - 눈 스트립 전체가 아니라, eye_cascade로 검출된
+#   "실제 눈 위치" 주변 패치에서만 안경테를 탐색한다.
+#   (눈썹/코 그림자 등 눈과 무관한 영역에서의 오탐 감소)
+# - 임계값을 기존보다 보수적으로 상향한다.
+# ============================================================
+
+def _score_glasses_patch(patch):
+    """
+    한 눈 주변 패치에서 안경 신호 3가지를 계산하고, 그 중 몇 개가
+    임계값을 넘는지(0~3)를 반환한다. 세 조건을 모두(AND) 요구하는
+    대신 다수결(2/3)로 판정해서 민감도를 높인다.
+    """
+
+    if patch.size == 0:
+        return 0
+
+    try:
+        glasses_candidates = glasses_cascade.detectMultiScale(
+            patch,
+            scaleFactor=1.05,
+            minNeighbors=6,   # 기존 10 → 완화 (너무 보수적이라 실측 미검출 다발)
+            minSize=(25, 18)
+        )
+        glasses_count = len(glasses_candidates)
+    except Exception:
+        glasses_count = 0
+
+    resized_patch = cv2.resize(patch, (160, 120))
+    blurred_patch = cv2.GaussianBlur(resized_patch, (5, 5), 0)
+    edges = cv2.Canny(blurred_patch, 60, 150)  # 임계값 소폭 완화
+
+    edge_ratio = float(np.mean(edges > 0))
+
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=25,
+        minLineLength=30,
+        maxLineGap=5
+    )
+
+    horizontal_lines = 0
+
+    if lines is not None:
+        for line in lines[:, 0]:
+            x1l, y1l, x2l, y2l = line
+            angle = abs(np.degrees(np.arctan2(y2l - y1l, x2l - x1l)))
+            if angle < 12 or angle > 168:
+                horizontal_lines += 1
+
+    signals = [
+        glasses_count >= 1,
+        horizontal_lines >= 2,   # 기존 3 → 완화
+        edge_ratio >= 0.045,     # 기존 0.06 → 완화
+    ]
+
+    return sum(signals)
+
+
+def detect_glasses_raw(eye_region, eyes):
+    """
+    NOTE(수정 이력): 기존 구현은 "haarcascade_eye.xml로 눈이 2개
+    이상 검출되어야만" 안경 검사를 시도했다. 그런데 안경 렌즈의
+    반사·테두리 때문에 바로 이 일반 눈 검출기가 눈을 못 찾는
+    경우가 흔해서, "안경을 썼기 때문에 오히려 안경 미검출로
+    처리되는" 역설이 있었다. 이를 고쳐 눈이 2개 미만 검출된
+    경우에도 eye_region 전체를 안경 전용 cascade로 한 번 더
+    스캔하도록 폴백을 추가했다. 또한 패치별 3개 신호를 모두
+    요구(AND)하던 것을 다수결(2/3 이상)로 완화했다.
+    """
+
+    if eye_region.size == 0 or glasses_cascade.empty():
+        return False
+
+    eh_region, ew_region = eye_region.shape[:2]
+
+    patches = []
+
+    if eyes is not None and len(eyes) >= 2:
+
+        eyes_sorted = sorted(eyes, key=lambda b: b[0])
+        left_eye = eyes_sorted[0]
+        right_eye = eyes_sorted[-1]
+
+        for (ex, ey, ew, eh) in (left_eye, right_eye):
+
+            # 패딩 확대: 안경테 위쪽(눈썹 부근)·옆쪽(관자놀이 쪽
+            # 다리) 라인이 패치 밖으로 잘려 미검출되는 문제 완화
+            pad_x = int(ew * 1.1)
+            pad_y = int(eh * 1.4)
+
+            x1 = max(0, ex - pad_x)
+            x2 = min(ew_region, ex + ew + pad_x)
+            y1 = max(0, ey - pad_y)
+            y2 = min(eh_region, ey + eh + pad_y)
+
+            patch = eye_region[y1:y2, x1:x2]
+
+            if patch.size > 0:
+                patches.append(patch)
+
+        # 눈이 검출된 경우에도, 패딩 영역 밖으로 벗어난 안경테를
+        # 잡기 위해 eye_region 전체를 보조 패치로 항상 추가한다.
+        if eye_region.size > 0:
+            patches.append(eye_region)
+
+    if not patches:
+        # 폴백: 일반 눈 검출기가 눈을 찾지 못한 경우(안경 반사·
+        # 테두리로 인한 미검출 가능성 포함) — eye_region 전체를
+        # 좌/우 절반으로 나눠 안경 전용 cascade로 직접 스캔한다.
+        mid = ew_region // 2
+        left_half = eye_region[:, :mid]
+        right_half = eye_region[:, mid:]
+
+        for half in (left_half, right_half):
+            if half.size > 0:
+                patches.append(half)
+
+    votes = 0
+
+    for patch in patches:
+        score = _score_glasses_patch(patch)
+        # 3개 신호 중 2개 이상이면 이 패치는 "안경 의심"으로 카운트
+        if score >= 2:
+            votes += 1
+
+    # 두 패치(또는 절반) 중 최소 한쪽에서 안경 의심 신호가 있으면
+    # "이번 프레임에서 안경으로 의심됨" 으로 판정
+    return votes >= 1
+
+
+# ============================================================
+# 얼굴 분석 (프레임 단위)
+#
+# 변경점:
+# - 더 이상 이 함수 내부에서 "안경 → 즉시 FAIL"을 결정하지 않는다.
+# - glasses 키에는 이번 프레임의 raw 신호만 담고,
+#   최종 FAIL 여부는 VideoProcessor에서 최근 프레임들의
+#   다수결(rolling majority)로 판단한다.
+#   → 조명/각도로 인한 단발성 오탐이 곧바로 화면을 FAIL로
+#     고정시키지 않도록 하여, 안경을 벗은 뒤에도 정상적으로
+#     PASS 로 전환되게 한다.
+# ============================================================
+
+def analyze_frame(frame):
+
+    result = {
+        "status": "UNKNOWN",
+        "message": "검사 중",
+
+        "face": False,
+        "face_box": None,
+        "eyes": False,
+
+        "glasses": False,   # 이번 프레임의 raw 신호 (다수결 이전)
+        "mask": False,
+        "hat": False,
+
+        "center": False,
+        "distance": False,
+        "lighting": False,
+        "frontal": False
+    }
+
+    if frame is None:
+        return result
+
+
+    h, w = frame.shape[:2]
+
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY
+    )
+
+
+    # ========================================================
+    # 밝기
+    # ========================================================
+
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+
+    result["lighting"] = (
+        45 <= brightness <= 220
+        and
+        contrast >= 18
+    )
+
+
+    # ========================================================
+    # 얼굴 검출
+    # ========================================================
+
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=6,
+        minSize=(120, 120)
+    )
+
+
+    if len(faces) == 0:
+
+        result["message"] = "얼굴을 정면으로 보여주세요."
+
+        return result
+
+
+    # 가장 큰 얼굴 사용
+    x, y, fw, fh = max(
+        faces,
+        key=lambda box: box[2] * box[3]
+    )
+
+
+    result["face"] = True
+    result["face_box"] = (int(x), int(y), int(fw), int(fh))
+
+
+    # ========================================================
+    # 얼굴 거리
+    # ========================================================
+
+    face_ratio = fw / float(w)
+
+    result["distance"] = (
+        0.25 <= face_ratio <= 0.72
+    )
+
+
+    # ========================================================
+    # 중앙 위치
+    # ========================================================
+
+    face_center_x = x + fw / 2
+    frame_center_x = w / 2
+
+    center_error = (
+        abs(face_center_x - frame_center_x) / w
+    )
+
+    result["center"] = (
+        center_error <= 0.15
+    )
+
+
+    # ========================================================
+    # 얼굴 ROI
+    # ========================================================
+
+    roi = gray[
+        y:y + fh,
+        x:x + fw
+    ]
+
+    if roi.size == 0:
+        return result
+
+
+    # ========================================================
+    # 조명 (얼굴 영역 기준으로 재판정)
+    #
+    # 화면 전체 밝기로 판정하면 배경이 밝은 역광 상황에서
+    # 얼굴이 어두워도 "조명 정상"으로 잘못 통과하거나,
+    # 반대로 밝은 배경 때문에 전체 평균이 튀어 계속 FAIL 나는
+    # 문제가 있어 얼굴 ROI 기준으로 다시 계산한다.
+    # ========================================================
+
+    face_brightness = float(np.mean(roi))
+    face_contrast = float(np.std(roi))
+
+    result["lighting"] = (
+        40 <= face_brightness <= 225
+        and
+        face_contrast >= 15
+    )
+
+
+    # ========================================================
+    # 눈 영역
+    # ========================================================
+
+    eye_top = int(fh * 0.18)
+    eye_bottom = int(fh * 0.58)
+
+    eye_region = roi[
+        eye_top:eye_bottom,
+        :
+    ]
+
+
+    eyes = []
+
+    if eye_region.size > 0:
+
+        eyes = eye_cascade.detectMultiScale(
+            eye_region,
+            scaleFactor=1.05,
+            minNeighbors=3,
+            minSize=(15, 15)
+        )
+
+
+    # 양쪽 눈이 충분히 검출되어야 PASS
+    result["eyes"] = len(eyes) >= 2
+
+
+    # ========================================================
+    # 정면 여부
+    # ========================================================
+
+    frontal = False
+
+    if len(eyes) >= 2:
+
+        eye_centers = []
+
+        for ex, ey, ew, eh in eyes:
+
+            eye_centers.append(
+                (
+                    ex + ew / 2,
+                    ey + eh / 2
+                )
+            )
+
+
+        eye_centers.sort(
+            key=lambda p: p[0]
+        )
+
+
+        left_eye = eye_centers[0]
+        right_eye = eye_centers[-1]
+
+
+        eye_distance = abs(
+            right_eye[0] - left_eye[0]
+        )
+
+        eye_height_difference = abs(
+            right_eye[1] - left_eye[1]
+        )
+
+
+        if (
+            eye_distance > fw * 0.18
+            and
+            eye_height_difference <
+            eye_distance * 0.35
+        ):
+
+            frontal = True
+
+
+    result["frontal"] = frontal
+
+
+    # ========================================================
+    # 안경 검사 (raw 신호만 계산, 최종 판정은 processor에서)
+    # ========================================================
+
+    result["glasses"] = detect_glasses_raw(eye_region, eyes)
+
+
+    # ========================================================
+    # 마스크 검사
+    #
+    # 경량 휴리스틱.
+    # 불확실하면 FAIL이 아니라 UNKNOWN으로 처리.
+    # ========================================================
+
+    lower_top = int(fh * 0.52)
+    lower_bottom = int(fh * 0.92)
+
+    lower_face = roi[
+        lower_top:lower_bottom,
+        :
+    ]
+
+
+    mask_suspicious = False
+
+
+    if lower_face.size > 0:
+
+        lower_std = float(
+            np.std(lower_face)
+        )
+
+        lower_mean = float(
+            np.mean(lower_face)
+        )
+
+
+        # 얼굴 하단이 지나치게 균일한 경우
+        # 마스크 후보로만 사용
+        mask_suspicious = (
+            lower_std < 22
+            and
+            55 < lower_mean < 225
+        )
+
+
+    # 눈은 보이는데 하단만 지나치게 균일한 경우
+    if (
+        mask_suspicious
+        and
+        result["eyes"]
+    ):
+
+        result["mask"] = False
+
+
+    # ========================================================
+    # 모자 검사
+    #
+    # 매우 보수적으로 후보만 계산
+    # ========================================================
+
+    upper_bottom = int(
+        fh * 0.22
+    )
+
+    upper_face = roi[
+        0:upper_bottom,
+        :
+    ]
+
+
+    hat_suspicious = False
+
+
+    if upper_face.size > 0:
+
+        upper_edges = cv2.Canny(
+            upper_face,
+            60,
+            150
+        )
+
+        upper_edge_ratio = float(
+            np.mean(
+                upper_edges > 0
+            )
+        )
+
+        hat_suspicious = (
+            upper_edge_ratio > 0.25
+        )
+
+
+    # 모자는 현재 확실한 AI 검출기가 아니므로
+    # 단순 edge만으로 FAIL 처리하지 않는다.
+    result["hat"] = False
+
+
+    # ========================================================
+    # 모든 촬영 조건
+    #
+    # 참고: 안경 여부는 여기서 판정하지 않는다.
+    # (VideoProcessor의 rolling majority 결과가 최종 FAIL/PASS를 덮어씀)
+    # ========================================================
+
+    required = [
+        result["face"],
+        result["eyes"],
+        result["center"],
+        result["distance"],
+        result["lighting"],
+        result["frontal"]
+    ]
+
+
+    if all(required):
+
+        result["status"] = "PASS"
+
+        result["message"] = (
+            "촬영 조건이 완료되었습니다."
+        )
+
+        return result
+
+
+    # ========================================================
+    # 미충족 이유
+    # ========================================================
+
+    result["status"] = "UNKNOWN"
+
+
+    if not result["face"]:
+
+        result["message"] = (
+            "얼굴을 카메라 정면에 보여주세요."
+        )
+
+    elif not result["eyes"]:
+
+        result["message"] = (
+            "양쪽 눈이 모두 보이도록 해주세요."
+        )
+
+    elif not result["center"]:
+
+        result["message"] = (
+            "얼굴을 화면 중앙에 맞춰주세요."
+        )
+
+    elif not result["distance"]:
+
+        result["message"] = (
+            "카메라와의 거리를 조절해주세요."
+        )
+
+    elif not result["lighting"]:
+
+        result["message"] = (
+            "조명이 너무 어둡거나 밝습니다."
+        )
+
+    elif not result["frontal"]:
+
+        result["message"] = (
+            "정면을 바라봐 주세요."
+        )
+
+    return result
+
+
+# ============================================================
+# VIDEO PROCESSOR
+# ============================================================
+
+# ============================================================
+# 선별검사 - mediapipe 랜드마커 (앱 수명 동안 1회만 로드/다운로드)
+# ============================================================
+
+@st.cache_resource(show_spinner="랜드마크 분석 모델을 불러오는 중...")
+def get_face_landmarker():
+
+    model_path = "face_landmarker.task"
+
+    if not os.path.exists(model_path):
+
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/"
+            "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+        )
+
+        try:
+            urllib.request.urlretrieve(url, model_path)
+        except Exception as e:
+            st.error(f"랜드마크 모델 다운로드에 실패했습니다: {e}")
+            st.stop()
+
+    BaseOptions = mp.tasks.BaseOptions
+    FaceLandmarker = mp.tasks.vision.FaceLandmarker
+    FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.IMAGE,
+        num_faces=1
+    )
+
+    return FaceLandmarker.create_from_options(options)
+
+
+# ============================================================
+# 선별검사 - 프레임 버퍼 캡처용 프로세서
+# ============================================================
+
+class ScreeningProcessor(VideoProcessorBase):
+
+    def __init__(self):
+
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        self.frames = []
+        self.done = False
+
+    def recv(self, frame):
+
+        image = frame.to_ndarray(
+            format="bgr24"
+        )
+
+        h, w = image.shape[:2]
+        max_width = 480
+
+        if w > max_width:
+            scale = max_width / float(w)
+            image = cv2.resize(
+                image,
+                (max_width, int(h * scale))
+            )
+
+        with self.lock:
+
+            elapsed = time.time() - self.start_time
+
+            if (
+                elapsed <= SCREENING_SECONDS
+                and len(self.frames) < SCREENING_MAX_FRAMES
+            ):
+                self.frames.append(image.copy())
+
+            if elapsed > SCREENING_SECONDS:
+                self.done = True
+
+        remaining = max(
+            0.0,
+            SCREENING_SECONDS - (time.time() - self.start_time)
+        )
+
+        cv2.rectangle(image, (10, 10), (300, 60), (0, 0, 0), -1)
+
+        cv2.putText(
+            image,
+            f"REC {remaining:0.1f}s",
+            (20, 45),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        return VideoFrame.from_ndarray(
+            image,
+            format="bgr24"
+        )
+
+    def get_state(self):
+
+        with self.lock:
+
+            elapsed = time.time() - self.start_time
+            frame_count = len(self.frames)
+            done = self.done
+            frames_copy = list(self.frames) if done else None
+
+        return elapsed, frame_count, done, frames_copy
+
+
+# ============================================================
+# 과제 수행 중 카메라 기록 (V2 · A안)
+#
+# 과제 화면(브라우저)과 카메라 처리(서버)는 시계가 따로다. 그래서 시행 단위가 아니라
+# '과제 구간(block) 단위'로만 맞춘다: 과제 컴포넌트가 구간의 시작·종료 절대시각(epoch)을
+# 돌려주고, 서버는 그 구간 안에서 받은 프레임만 분석한다. 두 시계의 어긋남은
+# 완료 시점의 지연으로 어림해 크게 어긋나면(2초 초과) 보정한다.
+# 영상은 (서버시각, JPEG)로 메모리에만 보관하고 디스크에 저장하지 않는다.
+# ============================================================
+
+class TaskCameraProcessor(VideoProcessorBase):
+
+    MAX_FRAMES = 7000        # 약 10fps x 700초 (과제 1~9 전체 약 10분)
+    MIN_INTERVAL = 0.1       # 저장 간격(초): 약 10fps
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frames = deque(maxlen=self.MAX_FRAMES)
+        self._last = 0.0
+
+    def recv(self, frame):
+        now = time.time()
+        if now - self._last >= self.MIN_INTERVAL:
+            self._last = now
+            image = frame.to_ndarray(format="bgr24")
+            h, w = image.shape[:2]
+            if w > 480:
+                scale = 480 / float(w)
+                image = cv2.resize(image, (480, int(h * scale)))
+            ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                with self.lock:
+                    self.frames.append((now, buf.tobytes()))
+        return frame
+
+    def get_frames(self, t0, t1):
+        with self.lock:
+            return [(ts, jpg) for ts, jpg in self.frames if t0 <= ts <= t1]
+
+
+def _voice_alignment(processor, voice):
+    """촬영 구간과 음성 수신 구간이 얼마나 겹치는지(참고용). 시계 어긋남은 확인하지 않는다."""
+    try:
+        if voice.get("status") != "ok":
+            return None
+        cam0 = float(processor.start_time)
+        cam1 = cam0 + SCREENING_SECONDS
+        v0 = voice["start_epoch_ms"] / 1000.0
+        v1 = voice["end_epoch_ms"] / 1000.0
+        return {
+            "overlap_s": round(max(0.0, min(cam1, v1) - max(cam0, v0)), 2),
+            "voice_start_after_camera_s": round(v0 - cam0, 2),
+            "clock_skew_checked": False,
+        }
+    except Exception:
+        return None
+
+
+# ============================================================
+# 선별검사 - 랜드마크 시각화 및 지표 산출
+# ============================================================
+
+# ============================================================
+# 선별검사 - 랜드마크 인덱스 상수
+#
+# 참고: MediaPipe FaceLandmarker는 478개 랜드마크(얼굴 468개 +
+# 양쪽 눈동자(iris) 각 5개)를 반환한다. 아래 인덱스는 공식
+# MediaPipe Face Mesh 문서 기준의 근사 매핑이며, 임상 검증된
+# 좌표가 아니라 프로토타입 계산용이다.
+# ============================================================
+
+LEFT_EYE_EAR_IDX = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_EAR_IDX = [362, 385, 387, 263, 373, 380]
+
+LEFT_IRIS_IDX = [474, 475, 476, 477]
+RIGHT_IRIS_IDX = [469, 470, 471, 472]
+
+NOSE_TIP_IDX = 1
+LEFT_MOUTH_IDX = 61
+RIGHT_MOUTH_IDX = 291
+LEFT_BROW_IDX = 105
+RIGHT_BROW_IDX = 334
+
+# [신규] 입을 벌리는 정도(위아래) 측정용 — 기존 LEFT/RIGHT_MOUTH_IDX는
+# 입꼬리(좌우 비대칭)만 측정하고, 입을 벌렸는지(발화 여부)는 별도
+# 랜드마크가 필요하다. 표준 MediaPipe Face Mesh 기준 윗입술/아랫입술
+# 안쪽 중앙점.
+UPPER_LIP_IDX = 13
+LOWER_LIP_IDX = 14
+
+# 얼굴 크기·카메라 거리에 따라 입 벌림 절대값이 달라지므로, 표정과
+# 무관하게 비교적 일정한 눈 사이 거리(양쪽 눈 바깥쪽 끝)로 나눠
+# 정규화한다. 이미 EAR 계산에 쓰는 인덱스를 그대로 재사용한다.
+LEFT_EYE_OUTER_IDX = 33
+RIGHT_EYE_OUTER_IDX = 263
+
+EAR_BLINK_THRESHOLD = 0.21  # 이 값 아래로 내려가면 "눈 감음"으로 판정
+
+# 촬영 시간(SCREENING_SECONDS) 동안 (정규화된) 입 벌림 정도의
+# 최대-최소 폭이 이 값 미만이면,
+# "속담을 소리 내어 말해달라"는 지시를 사실상 따르지 않은 것으로
+# 본다. 실제 발화 시 입 벌림 폭은 이 값보다 뚜렷하게 크게 나타난다는
+# 것을 전제로 한 잠정 임계값이며, 임상적으로 검증된 기준이 아니다.
+MOUTH_MOVEMENT_COMPLIANCE_THRESHOLD = 0.03
+
+
+def _eye_aspect_ratio(pts, idx):
+
+    p1, p2, p3, p4, p5, p6 = [pts[i] for i in idx]
+
+    vertical = (
+        np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5)
+    )
+    horizontal = np.linalg.norm(p1 - p4) * 2.0
+
+    if horizontal == 0:
+        return 0.3
+
+    return float(vertical / horizontal)
+
+
+def generate_landmark_visualization_and_metrics(frames):
+
+    landmarker = get_face_landmarker()
+
+    target_frame = frames[len(frames) // 2].copy()
+    h, w = target_frame.shape[:2]
+
+    # [2026 수정] 원래 60이었던 값은 7초 촬영(최대 90프레임) 기준으로,
+    # 실제로는 거의 다운샘플링이 발동하지 않는 수준이었다(90//60=1,
+    # 즉 사실상 전체 프레임을 다 분석하고 있었다). 촬영 시간을 15초로
+    # 늘리면서 이 값을 그대로 두면, 늘어난 프레임 수(최대 230장) 때문에
+    # 다운샘플링이 실제로 발동해(230//60=3) 분석 간격이 약 200ms까지
+    # 벌어진다 — 눈 깜빡임 하나의 지속시간(약 100~400ms)과 비슷해져
+    # 깜빡임을 놓칠 위험이 생긴다. 그래서 SCREENING_MAX_FRAMES와 동일하게
+    # 맞춰, 원래처럼 사실상 전체 프레임을 분석하도록 유지한다(다만 분석
+    # 시간이 늘어난 프레임 수만큼 비례해서 조금 더 걸릴 수 있다).
+    ANALYSIS_MAX_SAMPLES = SCREENING_MAX_FRAMES
+    step = max(1, len(frames) // ANALYSIS_MAX_SAMPLES)
+
+    motion_deltas = []
+    ear_series = []
+    asymmetry_series = []
+    gaze_x_series = []
+    mouth_opening_series = []  # [신규] 발화 과제 수행 여부 확인용
+
+    prev_pts = None
+    has_iris = None  # 첫 검출 시 478점 여부 확인
+
+    for idx in range(0, len(frames), step):
+
+        f_rgb = cv2.cvtColor(frames[idx], cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=f_rgb)
+        res = landmarker.detect(mp_image)
+
+        if not res.face_landmarks:
+            continue
+
+        pts = np.array(
+            [(lm.x, lm.y) for lm in res.face_landmarks[0]]
+        )
+
+        if has_iris is None:
+            has_iris = len(pts) >= 478
+
+        # --- 표정 변화 / 미세 근육 움직임 (프레임 간 랜드마크 이동량) ---
+        if prev_pts is not None and prev_pts.shape == pts.shape:
+            motion_deltas.append(
+                float(np.mean(np.abs(pts - prev_pts)))
+            )
+        prev_pts = pts
+
+        # --- 눈 깜빡임 (EAR) ---
+        left_ear = _eye_aspect_ratio(pts, LEFT_EYE_EAR_IDX)
+        right_ear = _eye_aspect_ratio(pts, RIGHT_EYE_EAR_IDX)
+        ear_series.append((left_ear + right_ear) / 2.0)
+
+        # --- 안면 비대칭 ---
+        nose = pts[NOSE_TIP_IDX]
+
+        mouth_l_dist = np.linalg.norm(pts[LEFT_MOUTH_IDX] - nose)
+        mouth_r_dist = np.linalg.norm(pts[RIGHT_MOUTH_IDX] - nose)
+        brow_l_dist = np.linalg.norm(pts[LEFT_BROW_IDX] - nose)
+        brow_r_dist = np.linalg.norm(pts[RIGHT_BROW_IDX] - nose)
+
+        mouth_asym = (
+            abs(mouth_l_dist - mouth_r_dist)
+            / (mouth_l_dist + mouth_r_dist + 1e-6)
+        )
+        brow_asym = (
+            abs(brow_l_dist - brow_r_dist)
+            / (brow_l_dist + brow_r_dist + 1e-6)
+        )
+
+        asymmetry_series.append((mouth_asym + brow_asym) / 2.0)
+
+        # --- [신규] 입 벌림 정도 (발화 과제 수행 여부 확인용) ---
+        # 눈 사이 거리로 정규화해 얼굴 크기·카메라 거리 영향을 줄인다.
+        face_scale = np.linalg.norm(
+            pts[LEFT_EYE_OUTER_IDX] - pts[RIGHT_EYE_OUTER_IDX]
+        )
+        if face_scale > 1e-6:
+            mouth_opening = np.linalg.norm(
+                pts[UPPER_LIP_IDX] - pts[LOWER_LIP_IDX]
+            )
+            mouth_opening_series.append(float(mouth_opening / face_scale))
+
+        # --- 시선 이동 (iris가 있을 때만) ---
+        if has_iris:
+
+            left_iris = pts[LEFT_IRIS_IDX].mean(axis=0)
+            right_iris = pts[RIGHT_IRIS_IDX].mean(axis=0)
+
+            gaze_x_series.append(
+                float((left_iris[0] + right_iris[0]) / 2.0)
+            )
+
+    # ------------------------------------------------------------
+    # 중간 프레임에 랜드마크 시각화
+    # ------------------------------------------------------------
+
+    target_rgb = cv2.cvtColor(target_frame, cv2.COLOR_BGR2RGB)
+    mp_target = mp.Image(image_format=mp.ImageFormat.SRGB, data=target_rgb)
+    detection_result = landmarker.detect(mp_target)
+
+    face_detected = bool(detection_result.face_landmarks)
+
+    if face_detected:
+
+        for face_landmarks in detection_result.face_landmarks:
+            for lm in face_landmarks:
+                x = int(lm.x * w)
+                y = int(lm.y * h)
+                cv2.circle(target_frame, (x, y), 1, (0, 255, 0), -1)
+
+    annotated_rgb = cv2.cvtColor(target_frame, cv2.COLOR_BGR2RGB)
+
+    # ------------------------------------------------------------
+    # 지표 집계
+    # ------------------------------------------------------------
+
+    expression_change = (
+        float(np.mean(motion_deltas) * 1000) if motion_deltas else 0.0
+    )
+    micro_movement = (
+        float(np.std(motion_deltas) * 500) if motion_deltas else 0.0
+    )
+
+    facial_asymmetry = (
+        float(np.mean(asymmetry_series) * 1000) if asymmetry_series else 0.0
+    )
+
+    if len(ear_series) >= 2:
+        below = np.array(ear_series) < EAR_BLINK_THRESHOLD
+        blink_count = int(np.sum(below[1:] & ~below[:-1]))
+        duration_sec = max(1.0, SCREENING_SECONDS)
+        blink_rate = float(blink_count / duration_sec * 60.0)
+    else:
+        blink_rate = 0.0
+
+    if has_iris and len(gaze_x_series) >= 2:
+        gaze_variability = float(np.std(gaze_x_series) * 1000)
+    else:
+        gaze_variability = None  # iris 미검출 시 측정 불가
+
+    # --- [신규] 발화 과제(속담 소리 내어 말하기) 수행 여부 추정 ---
+    # 이 시스템은 마이크로 소리를 녹음·검증하지 않는다. 대신 이미
+    # 갖고 있는 얼굴 랜드마크만으로, 촬영 시간(SCREENING_SECONDS) 동안
+    # 입이 실제로 벌어졌다
+    # 오므려졌다 했는지(=입 벌림 정도의 변동폭)를 보고 간접적으로
+    # 추정한다. 이 값은 위험도 점수 계산에는 전혀 쓰이지 않고, 오직
+    # "과제를 제대로 수행했는지"를 사용자에게 알려주기 위한 데이터
+    # 품질 지표로만 쓰인다 — 안 그러면 지시를 따르지 않아 입을 거의
+    # 안 움직인 사람이, 표정 변화가 적다는 이유로 오히려 더 "양호"로
+    # 잘못 판정될 위험이 있다(실제로 사용자가 지적해 발견한 문제).
+    if len(mouth_opening_series) >= 2:
+        mouth_movement_range = float(
+            max(mouth_opening_series) - min(mouth_opening_series)
+        )
+        speech_task_detected = mouth_movement_range >= MOUTH_MOVEMENT_COMPLIANCE_THRESHOLD
+    else:
+        mouth_movement_range = None
+        speech_task_detected = None  # 판단 불가(랜드마크 검출 자체가 부족)
+
+    metrics = {
+        "expression_change": expression_change,
+        "micro_movement": micro_movement,
+        "facial_asymmetry": facial_asymmetry,
+        "blink_rate": blink_rate,
+        "gaze_variability": gaze_variability,
+        "iris_available": bool(has_iris),
+        "mouth_movement_range": mouth_movement_range,
+        "speech_task_detected": speech_task_detected,
+    }
+
+    return annotated_rgb, metrics, face_detected
+
+
+def analyze_task_camera_block(frames, max_samples=450):
+    """한 과제 구간의 프레임 목록 [(서버시각, JPEG), ...]에서 카메라 보조 신호를 계산한다.
+    깜빡임 횟수는 구간의 실제 길이(첫~마지막 프레임 시각)로 환산한 분당 값이다.
+    임상 검증된 지표가 아니며, 구간 단위 참고값이다."""
+
+    if not frames:
+        return {"status": "no_frames"}
+
+    landmarker = get_face_landmarker()
+    step = max(1, len(frames) // max_samples)
+    picked = frames[::step]
+
+    ear_series, motion_deltas, gaze_x = [], [], []
+    prev_pts, has_iris, n_face = None, None, 0
+
+    for ts, jpg in picked:
+        img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+        )
+        res = landmarker.detect(mp_image)
+        if not res.face_landmarks:
+            prev_pts = None
+            continue
+        n_face += 1
+        pts = np.array([(lm.x, lm.y) for lm in res.face_landmarks[0]])
+        if has_iris is None:
+            has_iris = len(pts) >= 478
+        if prev_pts is not None and prev_pts.shape == pts.shape:
+            motion_deltas.append(float(np.mean(np.abs(pts - prev_pts))))
+        prev_pts = pts
+        ear_series.append(
+            (_eye_aspect_ratio(pts, LEFT_EYE_EAR_IDX)
+             + _eye_aspect_ratio(pts, RIGHT_EYE_EAR_IDX)) / 2.0
+        )
+        if has_iris:
+            li = pts[LEFT_IRIS_IDX].mean(axis=0)
+            ri = pts[RIGHT_IRIS_IDX].mean(axis=0)
+            gaze_x.append(float((li[0] + ri[0]) / 2.0))
+
+    covered = max(0.0, picked[-1][0] - picked[0][0]) if len(picked) > 1 else 0.0
+    eff_fps = (len(picked) - 1) / covered if covered > 0 else 0.0
+
+    blink_count, blink_rate = None, None
+    if len(ear_series) >= 2 and covered > 0:
+        below = np.array(ear_series) < EAR_BLINK_THRESHOLD
+        blink_count = int(np.sum(below[1:] & ~below[:-1]))
+        blink_rate = round(blink_count / covered * 60.0, 1)
+
+    face_ratio = n_face / max(1, len(picked))
+    return {
+        "status": "ok",
+        "n_frames_in_block": len(frames),
+        "n_frames_analyzed": len(picked),
+        "face_ratio": round(face_ratio, 3),
+        "covered_s": round(covered, 1),
+        "effective_fps": round(eff_fps, 1),
+        "blink_count": blink_count,
+        "blink_rate_per_min": blink_rate,
+        "mean_ear": round(float(np.mean(ear_series)), 4) if ear_series else None,
+        "expression_change": round(float(np.mean(motion_deltas) * 1000), 3) if motion_deltas else None,
+        "gaze_variability": round(float(np.std(gaze_x) * 1000), 3) if (has_iris and len(gaze_x) >= 2) else None,
+        "quality": "ok" if (face_ratio >= 0.8 and eff_fps >= 6.0) else "low",
+        "note": "block-level reference values; not clinically validated",
+    }
+
+
+# ------------------------------------------------------------
+# 시행(자극) 단위 카메라 분석: 자극이 뜬 시각 앞 0.3초~뒤 1.5초 창과, 말소리 구간별 입 움직임.
+# 아래 임계값은 모두 잠정값이며 임상적으로 검증되지 않았다.
+# ------------------------------------------------------------
+TRIAL_PRE_S = 0.3
+TRIAL_POST_S = 1.5
+TRIAL_BLINK_EARLY_S = 0.5
+VOICE_MOUTH_DELTA = 0.02     # 말소리 구간에서 입 벌림이 평소보다 이만큼(얼굴 높이 대비) 커지면 '입이 움직임'
+STIM_EVENTS = {
+    ("simple", "stimulus"), ("gonogo", "stimulus_go"), ("gonogo", "stimulus_nogo"),
+    ("words", "word_on"), ("digits", "digit_on"), ("shape", "item_on"), ("recall", "on"),
+}
+
+
+def _extract_frame_features(landmarker, ts, jpg):
+    """프레임 1장에서 (서버시각, 얼굴검출, EAR, 시선x, 코x, 코y, 입벌림) 추출. 얼굴이 없으면 face=False."""
+    img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    res = landmarker.detect(mp_image)
+    if not res.face_landmarks:
+        return {"ts": ts, "face": False}
+    pts = np.array([(lm.x, lm.y) for lm in res.face_landmarks[0]])
+    ear = (_eye_aspect_ratio(pts, LEFT_EYE_EAR_IDX) + _eye_aspect_ratio(pts, RIGHT_EYE_EAR_IDX)) / 2.0
+    gaze = None
+    if len(pts) >= 478:
+        li = pts[LEFT_IRIS_IDX].mean(axis=0)
+        ri = pts[RIGHT_IRIS_IDX].mean(axis=0)
+        gaze = float((li[0] + ri[0]) / 2.0)
+    face_h = float(np.linalg.norm(pts[10] - pts[152])) or 1.0
+    mouth = float(abs(pts[14][1] - pts[13][1]) / face_h)
+    return {"ts": ts, "face": True, "ear": float(ear), "gaze_x": gaze,
+            "nose_x": float(pts[1][0]), "nose_y": float(pts[1][1]), "mouth": mouth}
+
+
+def _window_stats(frames, t_on):
+    """한 자극 창(frames: ts 오름차순 특징 목록)의 지표."""
+    if len(frames) < 3:
+        return None
+    face = [f for f in frames if f["face"]]
+    out = {"n_frames": len(frames), "face_ratio": round(len(face) / len(frames), 3)}
+    blink_ts = []
+    if len(face) >= 2:
+        prev_low = face[0]["ear"] < EAR_BLINK_THRESHOLD
+        for f in face[1:]:
+            low = f["ear"] < EAR_BLINK_THRESHOLD
+            if low and not prev_low:
+                blink_ts.append(f["ts"])
+            prev_low = low
+    out["blink_count"] = len(blink_ts)
+    out["blink_early"] = any(t_on <= t <= t_on + TRIAL_BLINK_EARLY_S for t in blink_ts)
+    gx = [f["gaze_x"] for f in face if f.get("gaze_x") is not None]
+    out["gaze_range"] = round((max(gx) - min(gx)) * 1000, 2) if len(gx) >= 2 else None
+    if len(face) >= 2:
+        d = [abs(b["nose_x"] - a["nose_x"]) + abs(b["nose_y"] - a["nose_y"]) for a, b in zip(face, face[1:])]
+        out["head_move"] = round(float(np.mean(d)) * 1000, 3)
+    else:
+        out["head_move"] = None
+    out["mouth_max"] = round(max(f["mouth"] for f in face), 4) if face else None
+    return out
+
+
+def aggregate_trial_windows(series, events, blocks=None, shift=0.0):
+    """프레임 특징 시계열과 과제 이벤트(epoch ms)로 과제별 시행 단위 요약을 만든다.
+    순수 함수라 얼굴 모델 없이도 시험할 수 있다."""
+    series = sorted(series, key=lambda f: f["ts"])
+    per_task = {}
+    for e in events:
+        if (e.get("task"), e.get("event")) not in STIM_EVENTS:
+            continue
+        t_on = e["t_epoch_ms"] / 1000.0 + shift
+        w = [f for f in series if t_on - TRIAL_PRE_S <= f["ts"] <= t_on + TRIAL_POST_S]
+        st = _window_stats(w, t_on)
+        per_task.setdefault(e["task"], []).append(st)
+    result = {}
+    for task, lst in per_task.items():
+        ok = [x for x in lst if x]
+        entry = {"n_windows": len(lst), "n_with_frames": len(ok)}
+        if ok:
+            entry["face_ratio_mean"] = round(float(np.mean([x["face_ratio"] for x in ok])), 3)
+            entry["blinks_per_window_mean"] = round(float(np.mean([x["blink_count"] for x in ok])), 3)
+            entry["blink_early_frac"] = round(float(np.mean([1.0 if x["blink_early"] else 0.0 for x in ok])), 3)
+            g = [x["gaze_range"] for x in ok if x["gaze_range"] is not None]
+            entry["gaze_range_mean"] = round(float(np.mean(g)), 3) if g else None
+            h = [x["head_move"] for x in ok if x["head_move"] is not None]
+            entry["head_move_mean"] = round(float(np.mean(h)), 3) if h else None
+        result[task] = entry
+    # 말소리 구간과 입 움직임의 일치 (과제별)
+    face_all = [f for f in series if f["face"]]
+    base = float(np.median([f["mouth"] for f in face_all])) if face_all else None
+    names = []
+    for name, b in (blocks or {}).items():
+        names.append((name, b["start_epoch_ms"] / 1000.0 + shift, b["end_epoch_ms"] / 1000.0 + shift))
+    vc = {}
+    for e in events:
+        if e.get("task") != "voice" or not e.get("end_epoch_ms"):
+            continue
+        s0 = e["t_epoch_ms"] / 1000.0 + shift
+        s1 = e["end_epoch_ms"] / 1000.0 + shift
+        owner = next((n for n, a, b in names if a <= s0 <= b), "(과제 밖)")
+        w = [f for f in series if s0 <= f["ts"] <= s1 and f["face"]]
+        rec = vc.setdefault(owner, {"n_segments": 0, "n_with_frames": 0, "n_mouth_moved": 0, "peaks": []})
+        rec["n_segments"] += 1
+        if len(w) >= 2 and base is not None:
+            rec["n_with_frames"] += 1
+            peak = max(f["mouth"] for f in w) - base
+            rec["peaks"].append(peak)
+            if peak >= VOICE_MOUTH_DELTA:
+                rec["n_mouth_moved"] += 1
+    result["voice_camera"] = {
+        name: {
+            "n_segments": r["n_segments"], "n_with_frames": r["n_with_frames"],
+            "agreement": round(r["n_mouth_moved"] / r["n_with_frames"], 3) if r["n_with_frames"] else None,
+            "mean_peak_delta": round(float(np.mean(r["peaks"])), 4) if r["peaks"] else None,
+        } for name, r in vc.items()
+    }
+    result["note"] = "trial-level reference values; thresholds provisional; not clinically validated"
+    return result
+
+
+def analyze_task_camera_trials(processor, task_data, shift=0.0, max_frames=2000):
+    """자극·말소리 창에 속한 프레임만 골라 특징을 뽑고 시행 단위 요약을 만든다."""
+    events = task_data.get("events") or []
+    spans = []
+    for e in events:
+        t = e["t_epoch_ms"] / 1000.0 + shift
+        if (e.get("task"), e.get("event")) in STIM_EVENTS:
+            spans.append((t - TRIAL_PRE_S, t + TRIAL_POST_S))
+        elif e.get("task") == "voice" and e.get("end_epoch_ms"):
+            spans.append((t, e["end_epoch_ms"] / 1000.0 + shift))
+    if not spans:
+        return {"status": "no_events"}
+    lo = min(a for a, _ in spans)
+    hi = max(b for _, b in spans)
+    frames = [(ts, j) for ts, j in processor.get_frames(lo, hi)
+              if any(a <= ts <= b for a, b in spans)]
+    if not frames:
+        return {"status": "no_frames"}
+    step = max(1, len(frames) // max_frames)
+    frames = frames[::step]
+    landmarker = get_face_landmarker()
+    series = []
+    for ts, jpg in frames:
+        f = _extract_frame_features(landmarker, ts, jpg)
+        if f:
+            series.append(f)
+    out = aggregate_trial_windows(series, events, task_data.get("blocks"), shift)
+    out["status"] = "ok"
+    out["n_frames_analyzed"] = len(series)
+    return out
+
+
+def analyze_task_camera(processor, task_data):
+    """과제 컴포넌트가 돌려준 구간(block)별로 카메라 보조 신호를 계산한다."""
+    out = {}
+    # 얼굴 모델 파일이 없으면 get_face_landmarker()가 내려받다 실패할 때 앱 전체를 멈춘다(st.stop).
+    # 과제 결과를 잃지 않도록, 모델이 이미 있을 때만 분석하고 없으면 건너뛴다.
+    if not os.path.exists("face_landmarker.task"):
+        return {"status": "model_unavailable"}
+    try:
+        blocks = task_data.get("blocks") or {}
+        lag = time.time() - float(task_data["finished_at"]) / 1000.0
+        # 완료 보고가 서버에 닿기까지의 지연(수백 ms)을 넘는 어긋남은 시계 차이로 보고 보정한다
+        shift = lag if abs(lag) > 2.0 else 0.0
+        out["completion_lag_s"] = round(lag, 2)
+        out["clock_shift_applied_s"] = round(shift, 2)
+        for name in blocks.keys():
+            b = blocks.get(name)
+            if not b:
+                out[name] = {"status": "no_block"}
+                continue
+            t0 = b["start_epoch_ms"] / 1000.0 + shift
+            t1 = b["end_epoch_ms"] / 1000.0 + shift
+            out[name] = analyze_task_camera_block(processor.get_frames(t0, t1), max_samples=240)
+        out["trials"] = analyze_task_camera_trials(processor, task_data, shift)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def render_research_records(voice, task_data):
+    """리포트 화면의 연구용 기록 표시(참고용). 점수 계산에는 쓰이지 않는다."""
+    with st.expander("🔬 과제·카메라·음성 기록 (연구용, 참고)"):
+        st.caption(
+            "※ 진단이 아니며 임상 검증 전의 참고 기록입니다. 위험도 점수 계산에는 "
+            "아직 반영되지 않습니다. 소리 원본과 영상은 저장하지 않습니다."
+        )
+        if task_data:
+            st.markdown("**인지과제**")
+            st.json({
+                "단순 반응": task_data.get("simple", {}).get("summary"),
+                "구분해서 누르기": task_data.get("gonogo", {}).get("summary"),
+            })
+            b = task_data.get("b") or {}
+            if task_data.get("voice") or b.get("voice"):
+                st.markdown("**과제 중 음성(소리 크기 변화만, 녹음·전사 없음)**")
+                st.json({
+                    "과제 1·2 구간": task_data.get("voice"),
+                    "과제 3~9 구간": b.get("voice"),
+                })
+            if b:
+                def _pick(name, key="summary"):
+                    v = b.get(name) or {}
+                    return {"건너뜀": v.get("reason")} if v.get("skipped") else v.get(key)
+                st.markdown("**인지과제 3~9 (연구용 초안 문항)**")
+                st.json({
+                    "3 단어 외우기": {"세트": (b.get("words") or {}).get("set"),
+                                  "건너뜀": (b.get("words") or {}).get("skipped")},
+                    "4 숫자 따라 누르기": _pick("digits"),
+                    "5 번갈아 잇기": _pick("trail"),
+                    "6 동물 이름 말하기(음성 시간 정보)": _pick("animals", "features"),
+                    "7 도형 짝 맞추기": _pick("shape"),
+                    "8 단어 회상": _pick("recall"),
+                    "9 체크인(원시 응답 수, 점수 아님)": _pick("checkin"),
+                })
+            if task_data.get("camera"):
+                st.markdown("**과제 구간별 카메라 보조 신호**")
+                st.json(task_data["camera"])
+        if voice:
+            st.markdown("**속담 낭독 음성 시간 정보**")
+            if voice.get("status") == "ok":
+                st.json({
+                    "quality": voice.get("quality"),
+                    "features": voice.get("features"),
+                    "alignment": voice.get("alignment"),
+                })
+            else:
+                st.caption(f"음성 기록 없음 ({voice.get('status')})")
+
+
+# ============================================================
+# 개인 기준선(personal baseline) + 모집단 기준(population baseline)
+# 저장/조회
+#
+# PoC 단계 임시 저장소: 서버 로컬 JSON 파일에 저장한다.
+# 정식 서비스 단계에서는 반드시 실제 DB로 교체해야 한다
+# (Streamlit Cloud 재배포 시 파일이 초기화될 수 있음).
+#
+# 개인 저장소(baseline_store.json): user_id별 누적 세션 수와
+# 지표별 러닝 평균(running mean)을 저장 — compute_risk_score의
+# 개인화(personalization) 항에 쓰인다. 화면에 보여주는 "직전
+# 측정치 대비 비교"용으로 가장 최근 1회 측정치도 함께 보관한다.
+#
+# 모집단 저장소(population_store.json): 지금까지 앱을 사용한
+# 모든 세션의 지표값을 Welford's online algorithm으로 누적해
+# 지표별 평균·표준편차를 계속 갱신한다 — 세션이 쌓일수록 "평소
+# 범위" 추정이 스스로 정교해지는 구조.
+# ============================================================
+
+BASELINE_STORE_PATH = "baseline_store.json"
+POPULATION_STORE_PATH = "population_store.json"
+_baseline_lock = threading.Lock()
+_population_lock = threading.Lock()
+
+# 모집단 표본이 이 값 미만인 지표는 온라인 추정치(평균·표준편차)가
+# 통계적으로 불안정하다. 이럴 때 "그럴듯한 평균값"을 지어내는 대신
+# — 그 자체가 우리가 피하려던 '근거 없는 상수' 문제이므로 —
+# 지표별 표본이 충분해지기 전까지는 기존 검증된 레거시 선형 가중합
+# 방식(원래 app.py의 최초 버전)으로 안전하게 폴백한다.
+MIN_POPULATION_N = 30
+
+# 레거시(부트스트랩) 모드에서 쓰는 고정 계수 — 최초 프로토타입의
+# 값을 그대로 유지한다. 이 값들 역시 임상 검증된 것은 아니며,
+# 모집단 데이터가 쌓이기 전까지 쓰는 임시 방편임을 명시한다.
+LEGACY_WEIGHTS = {
+    "expression_change": 0.6,
+    "micro_movement": 0.8,
+    "facial_asymmetry": 0.5,
+    "blink_rate": 1.0,
+    "gaze_variability": 0.4,
+}
+
+# 지표별 가중치(데이터 기반 모드에서 사용) — 문헌에서 반복 검증된
+# 정도를 반영한 잠정값.
+# (반응속도·눈깜빡임·안면비대칭: 비교적 반복검증된 편 → 1.0,
+#  표정변화·시선변동성: 중간 → 0.8, 미세근육움직임: 근거 약함 → 0.5)
+# NOTE: 이 가중치 역시 사람이 정한 값으로, 실제 라벨(임상 진단·
+# MMSE 등) 데이터로 로지스틱 회귀 등을 돌려야 객관적 가중치를
+# 얻을 수 있다. 현재는 그런 라벨 데이터가 없다.
+METRIC_WEIGHTS = {
+    "expression_change": 0.8,
+    "micro_movement": 0.5,
+    "facial_asymmetry": 1.0,
+    "blink_rate": 1.0,
+    "gaze_variability": 0.8,
+    "reaction_ms": 1.0,
+}
+
+METRIC_LABELS = {
+    "expression_change": "표정 변화",
+    "micro_movement": "미세 근육 움직임",
+    "facial_asymmetry": "안면 비대칭",
+    "blink_rate": "눈 깜빡임 빈도(회/분)",
+    "gaze_variability": "시선 이동 변동성",
+    "reaction_ms": "반응속도(ms)",
+}
+
+# empirical Bayes 개인화 가중치 w = n_personal / (n_personal + K)
+EMPIRICAL_BAYES_K = 4
+
+# 비선형 스쿼싱 risk_score = 100 * (1 - exp(-Z/LAMBDA)) 의 상수
+SQUASH_LAMBDA = 2.0
+
+# 3단계 완충 라벨 임계값 (통합 Z 기준, 데이터 기반 모드에서 사용)
+TIER_THRESHOLDS = {
+    "양호": 0.5,
+    "주의": 1.5,
+    # 그 이상은 "확인 권장"
+}
+
+# 3단계 완충 라벨 임계값 (레거시 부트스트랩 모드, 0~100 스코어 기준)
+# [2026-09-27 수정] 33 -> 25 (선별검사는 위험을 놓치는 것이 더 나쁜
+# 실수이므로 "양호" 범위를 보수적으로 좁힘). 참고: 이 상수를 쓰는
+# compute_risk_score()는 현재 어디서도 호출되지 않는 사용 안 하는
+# 함수이지만, 혼란 방지를 위해 값은 맞춰둔다.
+LEGACY_TIER_THRESHOLDS = {
+    "양호": 25.0,
+    "주의": 66.0,
+    # 그 이상은 "확인 권장"
+}
+
+
+def _load_json_store(path, lock):
+
+    with lock:
+
+        if not os.path.exists(path):
+            return {}
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+
+def _save_json_store(path, lock, store):
+
+    with lock:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+
+
+# ------------------------------------------------------------
+# 모집단 통계 (population baseline)
+# ------------------------------------------------------------
+
+def get_population_stats():
+    """
+    지표별 (n, mean, std, ready)를 반환한다. ready=True는 표본이
+    MIN_POPULATION_N 이상이라 온라인 추정치를 신뢰할 수 있다는 뜻.
+    표본이 없거나 부족하면 mean/std는 None이며(지어낸 값을 채우지
+    않음), 호출 측(compute_risk_score)이 이를 보고 레거시 방식으로
+    폴백한다.
+    """
+
+    store = _load_json_store(POPULATION_STORE_PATH, _population_lock)
+
+    stats = {}
+
+    for key in LEGACY_WEIGHTS.keys() | {"reaction_ms"}:
+
+        entry = store.get(key)
+        n = entry.get("n", 0) if entry else 0
+
+        if entry is None or n < 2:
+            stats[key] = {"n": n, "mean": None, "std": None, "ready": False}
+            continue
+
+        mean = entry["mean"]
+        # Welford: variance = M2 / (n - 1)
+        variance = entry["m2"] / max(1, n - 1)
+        std = float(np.sqrt(variance)) if variance > 0 else None
+
+        stats[key] = {
+            "n": n,
+            "mean": mean,
+            "std": std,
+            "ready": (n >= MIN_POPULATION_N and std is not None and std > 1e-9),
+        }
+
+    return stats
+
+
+def update_population_stats(metrics, reaction_ms=None, demographics=None):
+    """
+    Welford's online algorithm으로 지표별 평균·분산을 갱신한다.
+    측정되지 않은(None) 지표는 건너뛴다.
+
+    [개선] demographics가 주어지면, 전체 통합 통계 갱신과는 별도로
+    risk_model.stratified_stats에도 같은 값을 하위집단 구획별로 추가
+    기록한다. 지금 당장 위험도 계산에는 영향이 없으며, 나중에 하위집단별
+    분포 차이를 감사하기 위한 부가 저장이다. demographics가 없으면
+    (현재 UI에 입력창이 없어 대부분 이 경우) 'age_unknown|sex_unknown'
+    구획에 쌓인다.
+    """
+
+    values = {
+        "expression_change": metrics.get("expression_change"),
+        "micro_movement": metrics.get("micro_movement"),
+        "facial_asymmetry": metrics.get("facial_asymmetry"),
+        "blink_rate": metrics.get("blink_rate"),
+        "gaze_variability": metrics.get("gaze_variability"),
+        "reaction_ms": reaction_ms,
+    }
+
+    with _population_lock:
+
+        store = _load_json_store(POPULATION_STORE_PATH, threading.Lock())
+
+        for key, x in values.items():
+
+            if x is None:
+                continue
+
+            entry = store.get(key, {"n": 0, "mean": 0.0, "m2": 0.0})
+
+            n = entry["n"] + 1
+            delta = x - entry["mean"]
+            mean = entry["mean"] + delta / n
+            delta2 = x - mean
+            m2 = entry["m2"] + delta * delta2
+
+            store[key] = {"n": n, "mean": mean, "m2": m2}
+
+        with open(POPULATION_STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+
+    try:
+        from risk_model.stratified_stats import update_stratified_stats
+        update_stratified_stats(metrics, reaction_ms, demographics)
+    except Exception:
+        # 감사용 부가 저장이 실패해도 핵심 위험도 계산 파이프라인에는
+        # 영향을 주지 않아야 한다 — 조용히 건너뛴다.
+        pass
+
+
+# ------------------------------------------------------------
+# 개인 기준선 (personal baseline)
+# ------------------------------------------------------------
+
+def get_baseline(user_id):
+    """직전 측정치 비교 화면(표시용)을 위한 개인 기준선 조회."""
+
+    store = _load_json_store(BASELINE_STORE_PATH, _baseline_lock)
+    entry = store.get(user_id)
+
+    if entry is None:
+        return None
+
+    # 과거 스키마(metrics/risk_score만 저장) 호환
+    return {
+        "metrics": entry.get("metrics", entry.get("last_metrics")),
+        "risk_score": entry.get("risk_score", entry.get("last_risk_score", 0.0)),
+        "saved_at": entry.get("saved_at", ""),
+    }
+
+
+def get_personal_stats(user_id):
+    """
+    개인화 항에 쓰이는 (n_personal, personal_mean) 조회.
+    기록이 없으면 n_personal=0.
+    """
+
+    if not user_id:
+        return 0, {}
+
+    store = _load_json_store(BASELINE_STORE_PATH, _baseline_lock)
+    entry = store.get(user_id)
+
+    if entry is None:
+        return 0, {}
+
+    n_personal = entry.get("n_sessions", 1 if "metrics" in entry else 0)
+    personal_means = entry.get("metric_means", {})
+
+    return n_personal, personal_means
+
+
+def save_baseline(user_id, metrics, risk_score, reaction_ms=None):
+    """
+    표시용 최근 측정치를 갱신하고, 개인화 항에 쓰이는 지표별
+    러닝 평균(metric_means)·분산(metric_m2, Welford 방식)과
+    세션 수(n_sessions)를 누적한다.
+
+    [개선] metric_m2를 추가로 누적하는 이유: risk_model의 EB 결합이
+    이제 평균뿐 아니라 표준편차도 개인화하도록 확장되었다(세션
+    8회 이상 누적 시). 이 값이 없으면 risk_model.app_py_adapter가
+    항상 모집단 표준편차로 폴백하므로, 이 저장 로직도 함께 갱신해야
+    실제로 개인화된 분산이 반영된다.
+
+    [2026-09-27 수정, B-4] 이전에는 모든 지표가 공유하는 n_sessions
+    하나로 Welford n을 갱신했다. 예를 들어 홍채 미검출로
+    gaze_variability가 3번 결측된 사용자라면, 실제로는 이 지표를
+    2번밖에 관측 못 했는데도 n_sessions(예: 5)를 그대로 써서
+    "5번째 관측"인 것처럼 평균을 갱신해버려, 새 관측치의 반영 비중이
+    실제보다 과소평가됐다. 이제 지표별로 각자 실제 관측 횟수
+    (metric_n)를 따로 추적해서, 그 지표가 결측 없이 실제로 몇 번
+    관측됐는지에 맞춰 정확하게 Welford를 갱신한다.
+    """
+
+    values = {
+        "expression_change": metrics.get("expression_change"),
+        "micro_movement": metrics.get("micro_movement"),
+        "facial_asymmetry": metrics.get("facial_asymmetry"),
+        "blink_rate": metrics.get("blink_rate"),
+        "gaze_variability": metrics.get("gaze_variability"),
+        "reaction_ms": reaction_ms,
+    }
+
+    with _baseline_lock:
+
+        store = _load_json_store(BASELINE_STORE_PATH, threading.Lock())
+        entry = store.get(user_id, {
+            "n_sessions": 0, "metric_means": {}, "metric_m2": {}, "metric_n": {}
+        })
+
+        n_prev = entry.get("n_sessions", 0)
+        means = dict(entry.get("metric_means", {}))
+        m2s = dict(entry.get("metric_m2", {}))
+        # 하위 호환: metric_n이 없던 옛 저장분은, 그때까지 저장된
+        # metric_means에 값이 있었다면 일단 n_sessions와 동일했다고
+        # 간주하고 시작한다(완전히 정확하진 않지만, 없던 것보다는
+        # 훨씬 낫고 이후로는 지표별로 정확히 갈라진다).
+        metric_n = dict(entry.get("metric_n", {
+            k: n_prev for k in means.keys()
+        }))
+
+        for key, x in values.items():
+            if x is None:
+                continue
+            prev_mean = means.get(key, x)
+            prev_m2 = m2s.get(key, 0.0)
+            n_new = metric_n.get(key, 0) + 1
+            # Welford 온라인 갱신 — 평균과 분산(m2)을 함께 누적
+            delta = x - prev_mean
+            new_mean = prev_mean + delta / n_new
+            delta2 = x - new_mean
+            means[key] = new_mean
+            m2s[key] = prev_m2 + delta * delta2
+            metric_n[key] = n_new
+
+        store[user_id] = {
+            "metrics": metrics,              # 최근 1회 측정치(표시용)
+            "risk_score": risk_score,        # 최근 1회 스코어(표시용)
+            "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+            "n_sessions": n_prev + 1,         # 표시·personal_confidence용 전체 세션 수
+            "metric_means": means,
+            "metric_m2": m2s,
+            "metric_n": metric_n,            # 지표별 실제 관측 횟수(Welford n)
+        }
+
+        with open(BASELINE_STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+
+
+# ------------------------------------------------------------
+# 위험도 통합 공식 v2 — 개인화 베이지안 Z-score 스코어
+# ------------------------------------------------------------
+
+def compute_risk_score(metrics, reaction_ms=None, user_id=None):
+    """
+    NOTE: 이 알고리즘은 기존 방식(임의 계수 곱 → 단순 평균 → 선형
+    clip)의 한계를 통계적으로 좀 더 설명 가능한 구조로 바꾼 것이며,
+    실제 임상 라벨(진단·MMSE 등) 데이터로 성능이 검증된 것은
+    아니다. PoC로 라벨 데이터가 모이기 전까지는 여전히 '검증되지
+    않은 프로토타입' 스코어라는 점을 화면에 항상 함께 고지해야
+    한다.
+
+    두 가지 모드로 동작한다.
+
+    [부트스트랩 모드] 모집단 표본이 MIN_POPULATION_N개 미만인 경우.
+      "평균이 얼마다"를 지어낼 근거가 없으므로, 억지로 Z-score를
+      계산하는 대신 기존에 쓰던 검증되지 않은 고정 계수(LEGACY_WEIGHTS)
+      선형 가중합 방식으로 안전하게 계산한다. 데이터가 부족한
+      상태에서 '통계적으로 보이는' 숫자를 지어내는 것보다, 이렇게
+      명시적으로 표시되는 임시 방식을 쓰는 편이 더 정직하다.
+
+    [데이터 기반 모드] 모집단 표본이 충분히 쌓인 경우.
+      1) 모집단 기준(μ_pop, σ_pop) — 실측 온라인 통계
+      2) 개인 기준(μ_personal) — 없으면 모집단에 전적으로 의존
+      3) 경험적 베이즈로 두 기준을 세션 수 기반 가중 결합
+      4) Z-score 표준화 후, "평소보다 나빠진" 방향만 인정(one-sided)
+      5) 지표별 가중 결합으로 통합 Z 산출
+      6) 지수함수 스쿼싱으로 0~100 스코어 산출 (선형 clip 대체)
+      7) 통합 Z를 3단계 라벨(양호/주의/확인 권장)로 변환
+    """
+
+    raw_values = {
+        "expression_change": metrics.get("expression_change"),
+        "micro_movement": metrics.get("micro_movement"),
+        "facial_asymmetry": metrics.get("facial_asymmetry"),
+        "blink_rate": metrics.get("blink_rate"),
+        "gaze_variability": metrics.get("gaze_variability"),
+        "reaction_ms": reaction_ms,
+    }
+
+    pop_stats = get_population_stats()
+    population_n = {k: pop_stats[k]["n"] for k in pop_stats}
+
+    # 게이트 지표: 촬영이 성공하면 항상 계산되는 blink_rate의 표본
+    # 수로 전체 모드를 결정한다(부분적으로 z와 레거시를 섞으면
+    # 스케일이 달라 해석이 어려워지므로, 모드는 세션 전체에 대해
+    # 하나로 통일한다).
+    bootstrap_mode = not pop_stats["blink_rate"]["ready"]
+
+    if bootstrap_mode:
+
+        raw_scores = {}
+
+        for key, weight in LEGACY_WEIGHTS.items():
+            x = raw_values[key]
+            label = METRIC_LABELS[key]
+            raw_scores[label] = round(x * weight, 2) if x is not None else None
+
+        if reaction_ms is not None:
+            raw_scores["반응속도(ms)"] = round(
+                max(0.0, (reaction_ms - 300.0) * 0.05), 2
+            )
+        else:
+            raw_scores["반응속도(ms)"] = None
+
+        scoreable = [v for v in raw_scores.values() if v is not None]
+
+        risk_score = float(
+            np.clip(np.mean(scoreable) * 1.2, 0.0, 100.0)
+        ) if scoreable else 0.0
+
+        if risk_score < LEGACY_TIER_THRESHOLDS["양호"]:
+            tier = "양호"
+        elif risk_score < LEGACY_TIER_THRESHOLDS["주의"]:
+            tier = "주의"
+        else:
+            tier = "확인 권장"
+
+        detail = {
+            "mode": "bootstrap_legacy",
+            "combined_z": None,
+            "tier": tier,
+            "n_personal": 0,
+            "population_n": population_n,
+        }
+
+        return risk_score, raw_scores, detail
+
+    # ---------------- 데이터 기반 모드 ----------------
+
+    n_personal, personal_means = get_personal_stats(user_id)
+
+    z_scores = {}
+    raw_scores = {}  # 화면 표시용 (지표별 z+ 값)
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+
+    for key, x in raw_values.items():
+
+        label = METRIC_LABELS[key]
+
+        if x is None:
+            raw_scores[label] = None
+            continue
+
+        pop = pop_stats[key]
+
+        if not pop["ready"]:
+            # 이 지표만 아직 표본이 부족한 경우(예: 시선/반응속도는
+            # 선택적으로만 측정됨) — 통합 스코어 계산에서는 제외하고
+            # 화면에는 '데이터 축적 중'으로 표시한다.
+            raw_scores[label] = None
+            continue
+
+        # 경험적 베이즈 가중 결합: 개인 세션이 쌓일수록 개인 기준
+        # 쪽으로 자연스럽게 수렴한다.
+        w_personal = n_personal / (n_personal + EMPIRICAL_BAYES_K)
+        mu_personal = personal_means.get(key, pop["mean"])
+        mu_ref = w_personal * mu_personal + (1 - w_personal) * pop["mean"]
+        sigma_ref = pop["std"]
+
+        z = (x - mu_ref) / sigma_ref
+        z_plus = max(0.0, z)  # 평소보다 좋아진 방향은 위험 가산 없음
+
+        z_scores[key] = z_plus
+
+        weight = METRIC_WEIGHTS[key]
+        weighted_sum += weight * z_plus
+        weight_total += weight
+
+        raw_scores[label] = round(z_plus, 3)  # 화면에는 z+ 값을 표시
+
+    combined_z = (weighted_sum / weight_total) if weight_total > 0 else 0.0
+
+    risk_score = float(100.0 * (1.0 - np.exp(-combined_z / SQUASH_LAMBDA)))
+    risk_score = float(np.clip(risk_score, 0.0, 100.0))
+
+    if combined_z < TIER_THRESHOLDS["양호"]:
+        tier = "양호"
+    elif combined_z < TIER_THRESHOLDS["주의"]:
+        tier = "주의"
+    else:
+        tier = "확인 권장"
+
+    detail = {
+        "mode": "data_driven",
+        "combined_z": combined_z,
+        "tier": tier,
+        "n_personal": n_personal,
+        "population_n": population_n,
+    }
+
+    return risk_score, raw_scores, detail
+
+
+class PrecheckProcessor(VideoProcessorBase):
+
+    def __init__(self):
+
+        self.lock = threading.Lock()
+
+        self.latest_result = None
+
+        self.pass_history = deque(
+            maxlen=10
+        )
+
+        self.fail_history = deque(
+            maxlen=5
+        )
+
+        # 안경 raw 신호의 최근 이력 (다수결 판정용)
+        # maxlen=8 -> 대략 초당 15~30프레임 기준 0.3~0.5초 내
+        # 안경을 벗으면 히스토리가 대부분 갱신되어 빠르게 복구된다.
+        self.glasses_history = deque(
+            maxlen=8
+        )
+
+        self.frame_count = 0
+
+        # 매 프레임 전체 분석을 돌리면 CPU 부하로 영상이 느려지므로
+        # N프레임마다 한 번만 무거운 분석(cascade + Canny + Hough)을 수행한다.
+        self._frame_idx = 0
+        self._analyze_every_n = 2
+
+
+    def recv(self, frame):
+
+        image = frame.to_ndarray(
+            format="bgr24"
+        )
+
+        # ----------------------------------------------
+        # 해상도 축소
+        #
+        # 브라우저가 media_stream_constraints를 무시하고 고해상도로
+        # 캡처하는 경우를 대비해, 분석/표시용 프레임 자체를 축소한다.
+        # Haar cascade는 픽셀 수에 거의 선형으로 느려지므로 이 한 번의
+        # resize가 전체 지연을 크게 줄여준다.
+        # ----------------------------------------------
+
+        h, w = image.shape[:2]
+        max_width = 480
+
+        if w > max_width:
+
+            scale = max_width / float(w)
+
+            image = cv2.resize(
+                image,
+                (max_width, int(h * scale))
+            )
+
+
+        self._frame_idx += 1
+
+        analyze_this_frame = (
+            self._frame_idx % self._analyze_every_n == 0
+            or self.latest_result is None
+        )
+
+
+        if analyze_this_frame:
+
+            result = analyze_frame(
+                image
+            )
+
+            with self.lock:
+
+                # ----------------------------------------------
+                # 안경 다수결 판정
+                #
+                # 최근 8프레임 중 5프레임 이상에서 안경 신호가
+                # 잡혀야만 "실제로 안경을 착용 중"으로 확정한다.
+                # 단발성 오탐(그림자, 눈썹 등)은 무시된다.
+                # ----------------------------------------------
+
+                self.glasses_history.append(
+                    result["glasses"]
+                )
+
+                glasses_votes = sum(self.glasses_history)
+                glasses_total = len(self.glasses_history)
+
+                glasses_confirmed = (
+                    glasses_total >= 4
+                    and glasses_votes / glasses_total >= 0.6
+                )
+
+                if glasses_confirmed:
+
+                    result["status"] = "FAIL"
+
+                    result["message"] = (
+                        "안경 또는 선글라스가 감지되었습니다. "
+                        "안경을 벗어주세요."
+                    )
+
+                self.latest_result = result
+
+                self.frame_count += 1
+
+                self.pass_history.append(
+                    result["status"] == "PASS"
+                )
+
+                self.fail_history.append(
+                    result["status"] == "FAIL"
+                )
+
+        else:
+
+            # 이번 프레임은 분석을 건너뛰고 최근 결과를 재사용한다
+            # (화면 오버레이만 매 프레임 갱신되어 영상 자체는 끊기지 않는다)
+            with self.lock:
+                result = self.latest_result
+
+
+        # ====================================================
+        # 화면 표시
+        # ====================================================
+
+        if result["status"] == "PASS":
+
+            display_color = (
+                0,
+                220,
+                0
+            )
+
+            display_text = (
+                "PASS - READY"
+            )
+
+        elif result["status"] == "FAIL":
+
+            display_color = (
+                0,
+                0,
+                255
+            )
+
+            display_text = (
+                "NOT ELIGIBLE"
+            )
+
+        else:
+
+            display_color = (
+                0,
+                180,
+                255
+            )
+
+            display_text = (
+                "CHECKING"
+            )
+
+
+        # 얼굴 위치 표시
+        #
+        # analyze_frame()이 이미 계산해 둔 좌표(result["face_box"])를
+        # 재사용한다. 예전 코드는 화면에 사각형을 그리기 위해 cascade를
+        # 프레임당 한 번 더(사실상 2배) 실행하고 있었다 — 이것이 영상
+        # 지연의 큰 원인 중 하나였다.
+
+        face_box = result.get("face_box") if result else None
+
+        if face_box is not None:
+
+            x, y, fw, fh = face_box
+
+            cv2.rectangle(
+                image,
+                (x, y),
+                (x + fw, y + fh),
+                display_color,
+                3
+            )
+
+
+        # 상태 박스
+        cv2.rectangle(
+            image,
+            (10, 10),
+            (430, 65),
+            (0, 0, 0),
+            -1
+        )
+
+
+        cv2.putText(
+            image,
+            display_text,
+            (20, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            display_color,
+            2,
+            cv2.LINE_AA
+        )
+
+
+        return VideoFrame.from_ndarray(
+            image,
+            format="bgr24"
+        )
+
+
+    # ========================================================
+    # 상태 가져오기
+    # ========================================================
+
+    def get_state(self):
+
+        with self.lock:
+
+            result = self.latest_result
+
+            pass_count = sum(
+                self.pass_history
+            )
+
+            fail_count = sum(
+                self.fail_history
+            )
+
+            frame_count = self.frame_count
+
+
+        return (
+            result,
+            pass_count,
+            fail_count,
+            frame_count
+        )
+
+
+# ============================================================
+# PRECHECK
+# ============================================================
+
+if st.session_state.stage == "precheck":
+
+    st.info(
+        "촬영 전 안경·선글라스·마스크·모자를 제거하고 "
+        "정면을 바라봐 주세요."
+    )
+
+
+    st.caption(
+        "조건이 일정 시간 연속으로 충족되면 "
+        "촬영 버튼 없이 자동으로 선별검사로 이동합니다."
+    )
+
+
+    # ========================================================
+    # 카메라
+    # ========================================================
+
+    ctx = webrtc_streamer(
+
+        key="health-precheck-camera-v6",
+
+        mode=WebRtcMode.SENDRECV,
+
+        video_processor_factory=PrecheckProcessor,
+
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 480, "max": 640},
+                "height": {"ideal": 360, "max": 480},
+                "frameRate": {"ideal": 15, "max": 20}
+            },
+            "audio": False
+        },
+
+        async_processing=True,
+
+        rtc_configuration=RTC_CONFIGURATION
+    )
+
+
+    # processor 저장
+    if ctx.video_processor is not None:
+
+        st.session_state.processor = (
+            ctx.video_processor
+        )
+
+
+    # ========================================================
+    # 자동 상태 감시
+    # ========================================================
+
+    @st.fragment(run_every=0.5)
+    def monitor_camera():
+
+        processor = (
+            st.session_state.get(
+                "processor"
+            )
+        )
+
+
+        if processor is None:
+
+            st.markdown(
+                '<div class="checking">'
+                '📷 카메라 준비 중...'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+            return
+
+
+        result, pass_count, fail_count, frame_count = (
+            processor.get_state()
+        )
+
+
+        # ====================================================
+        # PASS
+        # ====================================================
+
+        if pass_count >= 8:
+
+            st.markdown(
+                '<div class="pass">'
+                '✅ 촬영 조건 완료'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+
+            st.success(
+                "촬영 조건이 완료되었습니다. "
+                "자동으로 선별검사를 시작합니다."
+            )
+
+
+            if not st.session_state.transitioning:
+
+                st.session_state.transitioning = True
+                st.session_state.stage = "screening"
+
+                # 전체 앱 다시 실행
+                st.rerun()
+
+
+            return
+
+
+        # ====================================================
+        # FAIL
+        # ====================================================
+
+        if fail_count >= 2:
+
+            st.markdown(
+                '<div class="fail">'
+                '❌ 부적합 — 촬영 불가'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+
+            if result:
+
+                st.error(
+                    result.get(
+                        "message",
+                        "촬영 조건을 충족하지 못했습니다."
+                    )
+                )
+
+
+            return
+
+
+        # ====================================================
+        # 검사 중
+        # ====================================================
+
+        st.markdown(
+            '<div class="checking">'
+            '🔎 검사 중 — 촬영 불가'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+
+        if result:
+
+            st.warning(
+                result.get(
+                    "message",
+                    "촬영 조건을 확인하고 있습니다."
+                )
+            )
+
+
+        st.caption(
+            f"연속 PASS: {pass_count}/8"
+        )
+
+        st.caption(
+            f"검사 프레임: {frame_count}"
+        )
+
+
+    monitor_camera()
+
+
+# ============================================================
+# SCREENING
+# ============================================================
+
+elif st.session_state.stage == "screening":
+
+    st.markdown(
+        """
+        <div class="pass">
+        🧠 선별검사를 시작합니다.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+    # ========================================================
+    # 아직 분석 결과가 없으면 -> 촬영 진행
+    # ========================================================
+
+    if st.session_state.screening_result is None:
+
+        st.info(
+            f"화면을 정면으로 바라봐 주세요. "
+            f"{SCREENING_SECONDS}초간 자동으로 촬영됩니다."
+        )
+
+        st.caption(
+            "🗣️ 촬영이 시작되면 \"까마귀 날자 배 떨어진다\"를 또렷하게 큰 소리로 "
+            f"말씀해 주세요. 한 번으로 끝나지 않게, {SCREENING_SECONDS}초 촬영이 "
+            "끝날 때까지 여러 번 반복해서 말씀해 주시면 좋아요."
+        )
+
+        ctx = webrtc_streamer(
+
+            key="health-screening-camera-v1",
+
+            mode=WebRtcMode.SENDRECV,
+
+            video_processor_factory=ScreeningProcessor,
+
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 480, "max": 640},
+                    "height": {"ideal": 360, "max": 480},
+                    "frameRate": {"ideal": 15, "max": 20}
+                },
+                "audio": False
+            },
+
+            async_processing=True,
+
+            rtc_configuration=RTC_CONFIGURATION
+        )
+
+
+        if ctx.video_processor is not None:
+
+            st.session_state.screening_processor = (
+                ctx.video_processor
+            )
+
+
+        @st.fragment(run_every=0.3)
+        def monitor_screening():
+
+            processor = (
+                st.session_state.get(
+                    "screening_processor"
+                )
+            )
+
+            if processor is None:
+
+                st.markdown(
+                    '<div class="checking">'
+                    '📷 카메라 준비 중...'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+
+                return
+
+
+            elapsed, frame_count, done, frames = (
+                processor.get_state()
+            )
+
+            progress_ratio = min(1.0, elapsed / SCREENING_SECONDS)
+
+            st.progress(progress_ratio)
+
+            st.caption(
+                f"촬영 진행: "
+                f"{min(elapsed, SCREENING_SECONDS):0.1f} / "
+                f"{SCREENING_SECONDS}초 (프레임 {frame_count}장)"
+            )
+
+
+            # --- 음성 시간 정보 (V2 · 2번) ---
+            # 소리를 녹음하지 않고, 소리 크기 곡선만 브라우저에서 분석한다.
+            # 카메라가 켜진 뒤에 마운트되므로 촬영보다 1초 안팎 늦게 시작해 조금 늦게 끝난다.
+            if st.session_state.get("voice_result") is None:
+
+                voice_value = voice_timing_component(
+                    duration_s=SCREENING_SECONDS + 1.0,
+                    key=f"voice_timing_{st.session_state.cog_task_run}",
+                )
+
+                if voice_value is not None:
+
+                    voice_value = dict(voice_value)
+                    voice_value["alignment"] = _voice_alignment(
+                        processor, voice_value
+                    )
+                    st.session_state.voice_result = voice_value
+                    st.session_state.voice_wait_start = None
+
+
+            if done:
+
+                # 음성 컴포넌트가 아직 결과를 못 보냈다면 잠시 기다린다(최대 8초).
+                # 마이크가 없거나 거부되면 컴포넌트가 바로 알려주므로 오래 기다리지 않는다.
+                if st.session_state.get("voice_result") is None:
+
+                    if st.session_state.get("voice_wait_start") is None:
+                        st.session_state.voice_wait_start = time.time()
+
+                    if time.time() - st.session_state.voice_wait_start < 8.0:
+                        st.caption("🎤 음성 시간 정보를 마무리하는 중...")
+                        return
+
+                    st.session_state.voice_result = {"status": "timeout"}
+
+                if not frames:
+
+                    st.error(
+                        "촬영된 프레임이 없습니다. 다시 시도해 주세요."
+                    )
+
+                    return
+
+
+                with st.spinner("얼굴 랜드마크 분석 중..."):
+
+                    (
+                        annotated_rgb,
+                        metrics,
+                        face_detected
+                    ) = generate_landmark_visualization_and_metrics(
+                        frames
+                    )
+
+
+                if not face_detected:
+
+                    st.warning(
+                        "마지막 프레임에서 얼굴을 정확히 인식하지 "
+                        "못했습니다. 결과의 신뢰도가 낮을 수 있습니다."
+                    )
+
+                if not metrics["iris_available"]:
+
+                    st.info(
+                        "이 환경에서는 눈동자(iris) 랜드마크가 "
+                        "검출되지 않아 시선 이동 지표는 이번 결과에서 "
+                        "제외됩니다."
+                    )
+
+
+                st.session_state.screening_result = {
+                    "annotated_rgb": annotated_rgb,
+                    "metrics": metrics,
+                    "face_detected": face_detected,
+                }
+
+                st.session_state.stage = "reaction_test"
+
+                st.rerun()
+
+
+        monitor_screening()
+
+
+    # ========================================================
+    # 분석 결과가 있으면 -> 리포트 표시
+    # ========================================================
+
+    else:
+
+        st.info("촬영이 이미 완료되었습니다. 다음 단계로 이동합니다...")
+        st.session_state.stage = "reaction_test"
+        st.rerun()
+
+
+# ============================================================
+# 반응속도 테스트 단계
+# ============================================================
+
+elif st.session_state.stage == "reaction_test":
+
+    st.markdown(
+        """
+        <div class="pass">
+        ⚡ 반응속도 테스트
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.caption(
+        "※ 연구용 시제품의 인지과제입니다(진단 아님). 반응 2개, 단어·숫자·잇기·말하기·"
+        "도형·체크인까지 총 9개 과제로 약 8~10분 걸립니다. 모든 과제에서 카메라가 켜져 있고, "
+        "마이크는 소리 크기 변화만 계산합니다(녹음·저장·전사 안 함). 마이크가 없어도 터치로 진행할 수 있고, "
+        "각 과제는 건너뛸 수 있습니다."
+    )
+
+
+    if st.session_state.reaction_result is not None:
+
+        st.session_state.stage = "report"
+        st.rerun()
+
+
+    skip_col, _ = st.columns([1, 3])
+
+    with skip_col:
+
+        if st.button("건너뛰기 (측정 안 함)"):
+
+            st.session_state.reaction_result = {
+                "reaction_ms": None
+            }
+
+            st.session_state.stage = "report"
+
+            st.rerun()
+
+
+    # V2 인지과제 1·2번: 단순 반응 + Go/No-Go (한 컴포넌트가 두 과제를 연속 실행).
+    # 기존 점수 계산과의 호환을 위해 reaction_ms에는 단순 반응 중앙값을 넣고,
+    # 시행별 기록 전체는 task_data에 보관한다(리포트 화면의 표시는 아직 바꾸지 않음).
+    # 1단계(과제 1·2)가 끝나면 결과를 보관하고, 같은 화면에서 2단계(과제 3~9)를 이어서 진행한다.
+    # 카메라 위젯은 두 단계 동안 같은 key로 유지되어 계속 켜져 있다.
+    if st.session_state.cog_a is None:
+        a_value = cognitive_tasks_component(
+            simple_n=10,
+            gonogo_n=24,
+            time_scale=float(os.environ.get("COG_TIME_SCALE", "1.0")),   # 시험용(기본 1.0)
+            key=f"cognitive_tasks_{st.session_state.cog_task_run}",
+        )
+        component_value = None
+        if a_value is not None and a_value.get("status") == "ok":
+            st.session_state.cog_a = dict(a_value)
+            st.rerun()
+    else:
+        component_value = cognitive_tasks_b_component(
+            time_scale=float(os.environ.get("COG_TIME_SCALE", "1.0")),   # 시험용(기본 1.0)
+            debug=os.environ.get("COG_DEBUG") == "1",
+            key=f"cognitive_tasks_b_{st.session_state.cog_task_run}",
+        )
+
+    # 과제 중에도 카메라를 켜 둔다(V2 · A안). 자동 시작하고 작은 미리보기만 보여 준다.
+    # 프레임은 메모리에만 (서버시각, JPEG)로 보관하고, 과제가 끝나면 구간별로 분석한다.
+    task_cam_ctx = webrtc_streamer(
+
+        key=f"task-camera-{st.session_state.cog_task_run}",
+
+        mode=WebRtcMode.SENDRECV,
+
+        video_processor_factory=TaskCameraProcessor,
+
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 480, "max": 640},
+                "height": {"ideal": 360, "max": 480},
+                "frameRate": {"ideal": 15, "max": 20}
+            },
+            "audio": False
+        },
+
+        async_processing=True,
+
+        rtc_configuration=RTC_CONFIGURATION,
+
+        desired_playing_state=True,
+
+        video_html_attrs={
+            "style": {"width": "160px", "margin": "0 auto"},
+            "controls": False,
+            "autoPlay": True,
+        },
+    )
+
+    if task_cam_ctx.video_processor is not None:
+        st.session_state.task_camera_processor = task_cam_ctx.video_processor
+
+
+    if component_value is not None and component_value.get("status") == "ok":
+
+        b_value = dict(component_value)
+        task_data = dict(st.session_state.cog_a)
+        reaction_ms = task_data.get("reaction_ms")
+        task_data["b"] = b_value
+        # 카메라 구간 분석용: 두 단계의 구간(block)과 이벤트를 합친다
+        task_data["blocks"] = {
+            **(task_data.get("blocks") or {}),
+            **{f"b_{k}": v for k, v in (b_value.get("blocks") or {}).items()},
+        }
+        task_data["events"] = (task_data.get("events") or []) + (b_value.get("events") or [])
+        task_data["finished_at"] = b_value.get("finished_at", task_data.get("finished_at"))
+
+        cam_processor = st.session_state.get("task_camera_processor")
+
+        if cam_processor is not None:
+            with st.spinner("과제 중 카메라 기록을 분석하는 중..."):
+                task_data["camera"] = analyze_task_camera(
+                    cam_processor, task_data
+                )
+        else:
+            task_data["camera"] = {"status": "no_camera"}
+
+        st.session_state.reaction_result = {
+            "reaction_ms": float(reaction_ms) if reaction_ms is not None else None,
+            "task_data": task_data,
+        }
+
+        st.session_state.stage = "report"
+
+        st.rerun()
+
+
+# ============================================================
+# 최종 리포트 단계
+# ============================================================
+
+elif st.session_state.stage == "report":
+
+    screening = st.session_state.screening_result
+    reaction = st.session_state.reaction_result
+
+    if screening is None:
+
+        st.error("촬영 데이터가 없습니다. 처음부터 다시 시도해 주세요.")
+
+    else:
+
+        st.success("촬영 및 분석이 완료되었습니다.")
+
+        render_research_records(
+            st.session_state.get("voice_result"),
+            (reaction or {}).get("task_data"),
+        )
+
+        st.image(
+            screening["annotated_rgb"],
+            caption="추출된 얼굴 랜드마크",
+            use_container_width=True
+        )
+
+        # ========================================================
+        # 식별자 입력 (선택) — 입력하면 개인 기준선을 반영해
+        # 결과를 계산한다. 입력하지 않아도 결과 확인은 가능하다
+        # (이 경우 모집단 기준으로만 계산됨).
+        # ========================================================
+
+        st.markdown("### 👤 결과 계산을 위한 식별자 (선택)")
+
+        st.caption(
+            "입력하면 이후 측정에서 이번 결과와 비교하고, 반복 "
+            "측정이 쌓일수록 이 정보를 바탕으로 결과가 본인에게 "
+            "맞춰져요. 입력하지 않아도 결과는 확인할 수 있어요.\n\n"
+            "🔒 실명 대신 본인만 아는 별명이나 코드를 권장합니다 — "
+            "다만 실명을 입력하셔도, 실제 저장되는 값은 원문이 아니라 "
+            "되돌릴 수 없는 암호화된 코드로 자동 변환되어 저장되므로 "
+            "안전합니다."
+        )
+
+        user_id_raw = st.text_input(
+            "이름 또는 별명",
+            key="baseline_user_id"
+        )
+
+        # 화면 표시(예: "'홍길동'님의 기준선으로...")에는 사용자가
+        # 입력한 원문을 그대로 쓰되, 실제 저장/조회 키는 항상 익명화된
+        # 값을 사용한다 — 이 둘을 절대 섞어 쓰지 않도록 변수명을
+        # 분리해뒀다.
+        user_id_display = user_id_raw.strip() if user_id_raw else None
+        user_id = anonymize_user_id(user_id_raw)
+
+        reaction_ms = (reaction or {}).get("reaction_ms")
+
+        risk_score, raw_scores, detail, quantum_result = compute_dual_path_result(
+            screening["metrics"],
+            reaction_ms=reaction_ms,
+            user_id=user_id
+        )
+
+        # 모집단 통계 갱신 — 같은 세션에서 재실행(rerun)될 때마다
+        # 중복 반영되지 않도록 세션당 1회만 수행한다.
+        if not st.session_state.population_recorded:
+            update_population_stats(screening["metrics"], reaction_ms=reaction_ms)
+            st.session_state.population_recorded = True
+
+        st.markdown("### 📋 분석 리포트 (프로토타입)")
+
+        st.caption(
+            "※ 이 화면의 결과는 의료기기의 진단이 아니며, 질병의 "
+            "유무를 판단하지 않습니다. 각 지표를 살펴보는 방향은 "
+            "관련 연구(눈깜빡임률-MCI, 시선패턴-AD, 안면비대칭-AD "
+            "등)와 궤를 같이 하지만, 이 화면의 구체적 점수·가중치는 "
+            "임상적으로 검증되지 않은 프로토타입 계산값입니다."
+        )
+
+        # ========================================================
+        # [신규] 발화 과제 수행 여부 확인
+        # — 이 시스템은 마이크로 소리를 녹음·검증하지 않으므로,
+        # "속담을 소리 내어 말씀해 주세요"라는 지시를 실제로
+        # 따랐는지는 얼굴 랜드마크(입 벌림 변동폭)로만 간접 추정한다.
+        # speech_task_detected가 False면, 표정 변화가 적어 보이는 게
+        # '양호'해서가 아니라 '과제를 안 해서'일 수 있다는 것을 결과
+        # 판정보다 먼저 명확히 알린다 — 조용히 넘어가면 지시를 안 따른
+        # 사람이 오히려 더 좋은 결과로 오판될 위험이 있기 때문이다.
+        # ========================================================
+        speech_task_detected = screening["metrics"].get("speech_task_detected")
+
+        if speech_task_detected is False:
+            st.warning(
+                "🗣️ 촬영 중 입 움직임이 거의 감지되지 않았습니다. "
+                "\"까마귀 날자 배 떨어진다\"를 소리 내어 말씀하지 않으셨을 "
+                "가능성이 있습니다. 아래 결과는 표정 변화가 실제보다 적게 "
+                "측정되었을 수 있어 신뢰도가 낮습니다 — 다시 한 번, 촬영이 "
+                "끝날 때까지 반복해서 말씀하시면서 측정해 보시는 것을 "
+                "권장합니다."
+            )
+        elif speech_task_detected is None:
+            st.caption(
+                "ℹ️ 발화 과제(속담 소리 내어 말하기) 수행 여부는 이번 "
+                "촬영에서 판단할 만한 데이터가 부족해 확인하지 못했습니다."
+            )
+
+        TIER_STYLE = {
+            "양호":       {"color": "#2E7D32", "emoji": "🟢"},
+            "주의":       {"color": "#B8860B", "emoji": "🟡"},
+            "확인 권장":  {"color": "#C0392B", "emoji": "🔴"},
+        }
+
+        TIER_MESSAGE = {
+            "양호": (
+                "안심하셔도 좋습니다. 오늘 측정된 패턴은 양호한 "
+                "범위이니, 지금처럼 평소 습관을 유지해 보세요."
+            ),
+            "주의": (
+                "지속적인 관찰이 필요합니다. 평소와 다소 차이가 "
+                "있는 패턴이 관찰되니, 컨디션이나 수면 등의 영향일 "
+                "수 있는 만큼 다음 기회에 한 번 더 측정해 보시는 "
+                "것을 권합니다."
+            ),
+            "확인 권장": (
+                "가까운 신경과·정신건강의학과 또는 치매안심센터 "
+                "방문을 권해 드립니다. 평소와 뚜렷한 차이가 있는 "
+                "패턴이 관찰되어, 정확한 확인을 받아보시는 것이 "
+                "좋겠습니다."
+            ),
+        }
+
+        tier = detail["tier"]
+        style = TIER_STYLE[tier]
+
+        st.markdown(
+            f"<div style='padding:16px;border-radius:10px;"
+            f"background-color:{style['color']}1A;"
+            f"border:1px solid {style['color']};'>"
+            f"<span style='font-size:22px;font-weight:700;"
+            f"color:{style['color']};'>{style['emoji']} {tier}</span>"
+            f"<div style='margin-top:6px;'>{TIER_MESSAGE[tier]}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        # ========================================================
+        # [신규] 신뢰구간 안내 — 이 판정이 얼마나 확실한 추정인지
+        # ========================================================
+        ci = detail.get("confidence_interval")
+        if ci and ci.get("available"):
+            st.caption(
+                f"📏 95% 신뢰구간: {ci['lower']:.1f} ~ {ci['upper']:.1f}점 "
+                f"— 지금까지 쌓인 데이터로 추정한 불확실성 범위입니다. "
+                f"표본이 더 쌓일수록 이 범위는 좁아집니다."
+            )
+        elif ci:
+            st.caption(f"📏 {ci.get('note', '')}")
+
+        # ========================================================
+        # [신규] 통합 결과 (Fusion) — 6개 지표 → (AI 분석 / QAOA 분석)
+        # → 통합 알고리즘(AI 예측 + QAOA 가중치 + 개인 baseline + 결과
+        # 일관성) → 최종 위험도 구조를, 지금 당장 동작하는 규칙 기반
+        # 버전으로 구현한 것 (risk_model/fusion_preview.py).
+        #
+        # 주의: 이 구조를 "학습된 모델"로 구현한 진짜 버전은
+        # risk_model/fusion_model.py의 FusionModel(v4)이다. 그 모델은
+        # 라벨 데이터 150건 이상 + legacy/v3 대비 검증된 우위 + 사람의
+        # 승인이 있어야 is_reliable()이 True가 되는, 아직 준비되지
+        # 않은 챌린저다. 지금은 라벨 자체가 없어 그 모델을 쓸 수 없어서,
+        # 같은 4가지 입력(AI 예측/QAOA 가중치/개인 baseline/결과 일관성)을
+        # 사람이 정한 명시적 공식으로 결합한 잠정 버전을 대신 보여준다.
+        # 나중에 FusionModel이 승격되면 이 화면을 그 결과로 교체하면 된다.
+        # ========================================================
+        from risk_model.fusion_preview import compute_fusion_preview
+
+        fusion = compute_fusion_preview(
+            ai_risk_score=risk_score,
+            quantum_result=quantum_result,
+            n_personal=detail.get("n_personal", 0),
+        )
+        fusion_style = TIER_STYLE[fusion.tier]
+
+        st.markdown("### 🔗 통합 결과 (Fusion)")
+
+        st.markdown(
+            f"<div style='padding:16px;border-radius:10px;"
+            f"background-color:{fusion_style['color']}1A;"
+            f"border:2px solid {fusion_style['color']};'>"
+            f"<span style='font-size:22px;font-weight:700;"
+            f"color:{fusion_style['color']};'>{fusion_style['emoji']} {fusion.tier} "
+            f"— {fusion.fusion_score:.1f}점</span>"
+            f"<div style='margin-top:6px;font-size:13px;color:#555;'>{fusion.note}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        if quantum_result is not None:
+            st.markdown("##### 통합 알고리즘 구성 요소")
+            fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+            with fcol1:
+                st.metric("AI 예측", f"{fusion.ai_score:.1f}점")
+            with fcol2:
+                st.metric("QAOA 가중치 결과", f"{fusion.quantum_score:.1f}점")
+            with fcol3:
+                st.metric(
+                    "개인 baseline 반영도",
+                    f"{fusion.personal_confidence*100:.0f}%",
+                    help=f"개인 기록 {detail.get('n_personal', 0)}회 / 완전 반영 기준 8회"
+                )
+            with fcol4:
+                st.metric(
+                    "결과 일관성",
+                    f"{fusion.consistency*100:.0f}%",
+                    help="AI 경로와 QAOA 경로 판정이 얼마나 가까운지 (100%=완전 일치)"
+                )
+            st.caption(
+                f"통합 점수 = 개인 baseline 반영도만큼 (AI·QAOA 단순평균 "
+                f"{fusion.base_avg:.1f}점) 쪽으로, 나머지 비율만큼 (더 주의가 "
+                f"필요한 쪽 {fusion.conservative:.1f}점) 쪽으로 가중 결합 → "
+                f"**{fusion.fusion_score:.1f}점**"
+            )
+            if fusion.consistency < 0.7:
+                st.caption(
+                    "⚠️ AI 경로와 양자 경로의 결과 일관성이 낮습니다. 이런 세션은 "
+                    "통합 결과를 참고용으로만 보시고, 판단이 애매할 땐 재측정을 "
+                    "권합니다."
+                )
+            if not quantum_result.get("qaoa_matched_true_optimum", True):
+                st.caption(
+                    "ℹ️ 참고: 이번 세션의 양자 회로는 스스로 최적해를 찾지 못해 "
+                    "전수조사로 검증·보정된 값입니다 (QAOA 점수 자체는 항상 "
+                    "검증된 값이 사용됩니다)."
+                )
+
+            with st.expander("🤖 AI 경로 vs ⚛️ 양자 경로 (세부 비교)"):
+                qcol1, qcol2 = st.columns(2)
+                with qcol1:
+                    st.metric("AI 경로", f"{risk_score:.1f}점", detail["tier"])
+                with qcol2:
+                    st.metric(
+                        "양자 경로 (QAOA)",
+                        f"{quantum_result['risk_score']:.1f}점",
+                        quantum_result["tier"],
+                    )
+                if quantum_result["tier"] == detail["tier"]:
+                    st.caption("✅ 두 경로가 같은 3단계 판정에 도달했습니다.")
+                else:
+                    st.caption(
+                        f"⚠️ 두 경로의 3단계 판정이 다릅니다 (AI: {detail['tier']} / "
+                        f"양자: {quantum_result['tier']})."
+                    )
+            st.caption(
+                "이 비교는 매 세션 자동으로 기록되어, 향후 임상 라벨이 확보되면 "
+                "두 경로 중 어느 쪽이 실제 결과를 더 잘 예측했는지, 그리고 학습된 "
+                "Fusion 모델이 이 규칙 기반 버전보다 나은지를 사후 분석하는 데 "
+                "쓰입니다."
+            )
+        else:
+            # [2026-09-15 기준] 이제 부트스트랩 모드(첫 검사 포함)에서도
+            # 양자 경로가 계산되므로, 이 분기는 정상적인 경우에는 거의
+            # 발동하지 않는다 — 6개 지표가 전부 인식 실패한 것과 같은
+            # 극단적 예외 상황에서만 여기로 온다.
+            st.caption(
+                "⚛️ 촬영 조건(조명·각도 등)을 확인하시고 다시 측정해 보시는 것을 "
+                "권장합니다. 정상적으로 촬영되면 첫 검사부터 양자 경로도 함께 계산됩니다."
+            )
+
+        with st.expander("지표별 상세 보기 (참고용)"):
+
+            if detail["mode"] == "bootstrap_legacy":
+                st.caption(
+                    "⚙️ 현재는 이 앱을 사용한 세션 수가 아직 적어 "
+                    "(모집단 기준 최소 표본 수 미만), 지표별 실측 "
+                    "평균·표준편차 대신 임시 고정 계수로 계산한 "
+                    "결과입니다. 사용 세션이 쌓이면 자동으로 "
+                    "통계 기반 방식으로 전환됩니다. 아래 값은 "
+                    "원시 측정값에 고정 계수를 곱한 참고 수치입니다."
+                )
+            elif detail.get("scored_by") == "learned_model":
+                st.caption(
+                    "🤖 학습된 위험도 모델(데이터 기반)로 계산된 결과입니다. "
+                    "아래 값은 표준화 지표(z+)가 아닌 원시 측정값입니다. "
+                    f"참고: 같은 조건에서 기존 통계 기반 방식은 "
+                    f"{detail['legacy_risk_score']:.1f}점(100점 만점)이었습니다."
+                )
+            else:
+                st.caption(
+                    "각 값은 '평소·모집단 대비 얼마나 벗어났는지'를 "
+                    "나타내는 표준화 지표(z+)이며, 원시 측정값 자체가 "
+                    "아닙니다. 0에 가까울수록 평소·다른 사용자들과 "
+                    "비슷한 패턴입니다."
+                )
+
+            for name, val in raw_scores.items():
+
+                if val is None:
+                    st.write(f"- {name}: 측정 안 됨 (또는 데이터 축적 중)")
+                else:
+                    st.write(f"- {name}: {val:.2f}")
+
+            if detail.get("clipped_metrics"):
+                clipped_labels = ", ".join(
+                    METRIC_LABELS.get(k, k) for k in detail["clipped_metrics"]
+                )
+                st.caption(
+                    f"⚠️ {clipped_labels}에서 유난히 큰 값이 측정되어, "
+                    "이 값 하나가 전체 점수를 과도하게 끌어올리지 않도록 "
+                    "상한선을 적용했습니다. 측정 환경(주의 분산, 지연 등)을 "
+                    "점검해보시면 좋습니다."
+                )
+
+            if detail["mode"] in ("data_driven", "learned_model"):
+                if detail["n_personal"] > 0:
+                    st.caption(
+                        f"※ 개인 기록 {detail['n_personal']}회가 반영된 "
+                        f"결과입니다 (기록이 쌓일수록 본인 평소 패턴 "
+                        f"비중이 커집니다)."
+                    )
+                else:
+                    st.caption("※ 개인 기록이 없어 모집단 기준으로만 계산됐습니다.")
+
+            st.caption(
+                "지표별 누적 세션 수(참고): " + ", ".join(
+                    f"{METRIC_LABELS[k]} {v}회"
+                    for k, v in detail["population_n"].items()
+                )
+            )
+
+            st.caption(
+                f"내부 계산용 참고 수치(비공개 스코어): {risk_score:.1f} / 100 "
+                "— 화면에 노출되는 최종 결과는 위 3단계 판정이며, 이 "
+                "수치 자체는 정상·비정상을 가르는 절대 기준이 아닙니다."
+            )
+
+        # NOTE: 이전에는 여기에 st.progress()와 "참고용 종합 점수
+        # N/100" 캡션을 화면에 노출했으나, 숫자 스코어가 "위험도"로
+        # 오독될 소지가 있어 제거했다. 결과 화면의 주 정보는 위의
+        # 3단계 판정(양호/주의/확인 권장)이며, 원시 참고 수치는
+        # "지표별 상세 보기" expander 안에서만 확인할 수 있다.
+
+        # ========================================================
+        # [신규] 판정 기준 참고
+        # — 부트스트랩/데이터기반 모드는 계산 방식 자체가 달라(전자는
+        # risk_score 자체를 33/66으로, 후자는 combined_Z를 0.5/1.5로
+        # 구분), 두 기준을 하나의 표로 뭉뚱그리면 오해를 부른다. 그래서
+        # "지금 이 결과가 실제로 계산된 모드"의 기준만 보여준다.
+        # ========================================================
+
+        with st.expander("📐 판정 기준 참고"):
+
+            current_mode = detail.get("legacy_mode", detail.get("scored_by"))
+
+            if current_mode == "data_driven":
+                st.markdown(
+                    "**현재 결과는 데이터기반 모드로 계산되었습니다.** "
+                    "이 모드는 점수 자체가 아니라 '평소·모집단 대비 얼마나 "
+                    "벗어났는지(종합 편차지수, combined_Z)'로 3단계를 나눕니다."
+                )
+                st.markdown(
+                    "- 🟢 **양호**: combined_Z < 0.5 (참고 환산 시 약 22점 미만)\n"
+                    "- 🟡 **주의**: 0.5 ≤ combined_Z < 1.5 (참고 환산 시 약 22~53점)\n"
+                    "- 🔴 **확인 권장**: combined_Z ≥ 1.5 (참고 환산 시 약 53점 이상)"
+                )
+            else:
+                st.markdown(
+                    "**현재 결과는 부트스트랩(초기) 모드로 계산되었습니다.** "
+                    "아직 모집단 표본이 충분히 쌓이지 않아, 고정 계수로 계산한 "
+                    "참고 점수(0~100) 자체를 기준으로 3단계를 나눕니다."
+                )
+                st.markdown(
+                    "- 🟢 **양호**: 점수 < 25\n"
+                    "- 🟡 **주의**: 25 ≤ 점수 < 66\n"
+                    "- 🔴 **확인 권장**: 점수 ≥ 66"
+                )
+
+            st.caption(
+                "⚠️ 두 모드는 계산 방식 자체가 달라 점수를 서로 직접 비교할 수 "
+                "없습니다. 또한 이 경계값(33/66, 0.5/1.5)은 임상 라벨 데이터로 "
+                "검증된 진단 기준이 아니라, 현재 프로토타입 단계의 잠정 설정값입니다."
+            )
+
+        # ========================================================
+        # [신규] 참고문헌
+        # — 6개 바이오마커 각각을 '관찰 대상으로 삼는' 방향성의 근거가
+        # 된 문헌. 본 앱의 구체적 계산식·가중치·임계값을 검증한
+        # 논문이 아니라는 점을 항상 caption으로 같이 명시한다 —
+        # 그렇지 않으면 참고문헌 나열 자체가 "임상적으로 검증됨"이라는
+        # 인상을 줄 위험이 있다.
+        # ========================================================
+
+        with st.expander("📚 참고문헌"):
+
+            st.caption(
+                "아래 문헌들은 각 지표의 구체적 점수화 공식(가중치·임계값)의 "
+                "출처가 아니라, '이 신호를 관찰 대상으로 삼는다'는 방향성이 "
+                "근거하고 있는 관련 연구입니다. 본 앱의 계산식·가중치를 그대로 "
+                "검증한 임상 논문이 아니며, 본 앱은 진단 도구가 아닙니다."
+            )
+
+            st.markdown(
+                "**표정 변화 · 미세 근육 움직임**\n"
+                "- Jiang, Z. et al. (2022). Automated analysis of facial "
+                "emotions in subjects with cognitive impairment. *PLOS ONE*, "
+                "17(1), e0262527.\n"
+                "- Fei, Z. et al. (2022). A novel deep neural network-based "
+                "emotion analysis system for automatic detection of MCI in "
+                "the elderly. *Neurocomputing*, 468, 306–316.\n"
+                "- Oh, Y.-H. et al. (2018). A Survey of Automatic Facial "
+                "Micro-Expression Analysis. *Frontiers in Psychology*, 9, 1128."
+            )
+            st.markdown(
+                "**안면 비대칭**\n"
+                "- Chien, C.-F. et al. (2023). Analyzing Facial Asymmetry in "
+                "Alzheimer's Dementia Using Image-Based Technology. "
+                "*Biomedicines*, 11(10), 2802."
+            )
+            st.markdown(
+                "**눈 깜빡임 빈도**\n"
+                "- Ladas, A. et al. (2014). Eye Blink Rate as a biological "
+                "marker of Mild Cognitive Impairment. *International Journal "
+                "of Psychophysiology*, 93, 12–16.\n"
+                "- D'Antonio, F. et al. (2021). Blink Rate Study in Patients "
+                "with Alzheimer's Disease, MCI and SCD. *Current Alzheimer "
+                "Research*, 18(14).\n"
+                "- Soukupová, T., Čech, J. (2016). Real-Time Eye Blink "
+                "Detection Using Facial Landmarks. *21st Computer Vision "
+                "Winter Workshop*."
+            )
+            st.markdown(
+                "**시선 이동 변동성**\n"
+                "- Oyama, A. et al. (2019). Novel Method for Rapid Assessment "
+                "of Cognitive Impairment Using High-Performance Eye-Tracking "
+                "Technology. *Scientific Reports*, 9, 12932."
+            )
+            st.markdown(
+                "**반응속도**\n"
+                "- O'Callaghan, C. et al. (2019). Sustained attention "
+                "failures on a 3-min reaction time task is a sensitive "
+                "marker of dementia. *Journal of Neurology*, 266(6), "
+                "1323–1332.\n"
+                "- Kochan, N.A. et al. (2016). Reaction time measures "
+                "predict incident dementia. *American Journal of Geriatric "
+                "Psychiatry*, 24(3), 221–231.\n"
+                "- Phillips, M. et al. (2013). Intra-individual reaction "
+                "time variability in MCI and AD. *PLOS ONE*, 8(5), e65712."
+            )
+            st.markdown(
+                "**통합 알고리즘의 통계적 기법**\n"
+                "- Welford, B.P. (1962). Note on a method for calculating "
+                "corrected sums of squares and products. *Technometrics*, "
+                "4(3), 419–420.\n"
+                "- Efron, B., Morris, C. (1977). Stein's Paradox in "
+                "Statistics. *Scientific American*, 236(5), 119–127."
+            )
+
+
+        # ========================================================
+        # 양자 회로 분석 (실험적 기능)
+        # — 데이터기반 모드(z_plus_by_metric이 채워진 경우)에서만 표시.
+        # risk_score에는 enable_quantum_modifier 설정에 따라서만 영향을
+        # 주며, 이 섹션의 시각화 자체는 항상 참고용이다.
+        # ========================================================
+
+        if detail.get("z_plus_by_metric"):
+
+            with st.expander("⚛️ 양자 회로 분석 (실험적 기능)"):
+
+                st.warning(
+                    "이 섹션은 실험적 기능입니다. 실제 양자 하드웨어를 사용하지 "
+                    "않으며(클래식 컴퓨터에서 양자역학 방정식을 시뮬레이션), "
+                    "여기 표시되는 값들은 위 지표별 상세 보기에 있는 6개 z-score를 "
+                    "다른 수학적 형태로 재표현한 것입니다. **질환 판정의 근거가 "
+                    "아니며**, risk_score에 미치는 영향은 최대 ±5점으로 제한되어 "
+                    "있습니다 (기본값은 미반영)."
+                )
+
+                from risk_model.quantum_modifier import (
+                    compute_quantum_modifier,
+                    compute_entanglement_analysis,
+                    render_entanglement_figure,
+                    simulate_shot_noise_variability,
+                    render_noise_variability_figure,
+                )
+
+                z_plus = detail["z_plus_by_metric"]
+
+                q_result = compute_quantum_modifier(z_plus, enabled=True)
+
+                st.markdown("#### 양자 회로 측정 지표")
+                qcol1, qcol2, qcol3 = st.columns(3)
+                qcol1.metric("양자 섀넌 엔트로피", f"{q_result.entropy:.3f}", help="0(완전히 예측 가능)~6(완전히 무작위) 범위")
+                qcol2.metric("최대 상태 집중도", f"{q_result.max_probability:.1%}", help="가장 확률이 높은 측정 결과 하나에 확률이 얼마나 쏠려있는지")
+                qcol3.metric(
+                    "risk_score 보정 반영치",
+                    f"{q_result.modifier_points:+.2f}점",
+                    help="실제 반영 여부는 enable_quantum_modifier 설정에 따름 (기본 미반영)",
+                )
+                st.caption(q_result.note)
+
+                st.markdown("---")
+
+                st.markdown("#### 얽힘이 만드는 비선형 상호작용")
+                st.caption(
+                    "왼쪽: 큐비트 하나하나가 독립적일 때(얽힘 없음)와, CNOT으로 얽었을 때 "
+                    "각 큐비트의 측정 확률이 어떻게 달라지는지 비교합니다. "
+                    "오른쪽: 인접한 두 큐비트가 서로 얼마나 통계적으로 연관되어 있는지(상관계수) "
+                    "비교합니다 — 얽힘이 없으면 이론상 항상 0이고, 얽히면 0이 아닌 값이 나옵니다. "
+                    "이 차이 자체가 '고전적 단순 결합(가중합)'과 '양자 얽힘'의 수학적 차이를 "
+                    "보여주는 것이며, 치매 위험도와의 임상적 상관관계를 의미하지는 않습니다."
+                )
+                analysis = compute_entanglement_analysis(z_plus)
+                fig1 = render_entanglement_figure(analysis)
+                st.pyplot(fig1)
+
+                st.markdown("---")
+
+                st.markdown("#### 만약 실제 양자 하드웨어를 썼다면? (노이즈 변동성 시뮬레이션)")
+                st.caption(
+                    "지금까지의 모든 계산은 노이즈 없는 이론적 시뮬레이션(Statevector)입니다. "
+                    "아래 버튼을 누르면, 실제 양자 하드웨어에서 흔히 발생하는 기본 노이즈(depolarizing "
+                    "noise)와 측정 반복 횟수(shot 수) 부족이 결과를 얼마나 흔들리게 만드는지를 "
+                    "별도로 시뮬레이션해 보여줍니다. **이 결과는 risk_score 계산에 전혀 반영되지 "
+                    "않는 참고용 자료입니다.**"
+                )
+
+                if st.button("🔬 노이즈 변동성 시뮬레이션 실행", key="run_noise_sim"):
+                    with st.spinner("노이즈 모델로 반복 시뮬레이션 중..."):
+                        noise_result = simulate_shot_noise_variability(
+                            z_plus,
+                            shot_counts=(64, 256, 1024),
+                            depolarizing_prob=0.03,
+                            trials_per_shot_count=20,
+                        )
+                    fig2 = render_noise_variability_figure(noise_result)
+                    st.pyplot(fig2)
+                    st.caption(
+                        f"측정 반복 횟수(shot)가 적을수록 엔트로피 추정치가 이론값"
+                        f"({noise_result.noiseless_entropy:.3f})에서 크게 벗어나고 흩어지는 것을 "
+                        "볼 수 있습니다. 이는 '양자컴퓨팅이 정밀하다'는 것이 아니라, 오히려 "
+                        "노이즈와 샘플링 부족이 실제 하드웨어에서 결과를 얼마나 불안정하게 "
+                        "만들 수 있는지를 보여주기 위한 것입니다."
+                    )
+
+
+        # ========================================================
+        # 개인 기준선 비교
+        # ========================================================
+
+        st.markdown("---")
+        st.markdown("### 📈 이전 측정치와 비교")
+
+        st.caption(
+            "※ '정상인 평균'이 아니라, 같은 사람의 과거 측정치와 "
+            "비교하는 기능입니다. 절대적인 정상 범위를 판단하는 "
+            "것이 아니라, 본인의 변화 추이만을 보여줍니다."
+        )
+
+        if user_id:
+
+            baseline = get_baseline(user_id)
+
+            if baseline is None:
+
+                if st.button("이번 결과를 내 기준선으로 저장", use_container_width=True):
+
+                    save_baseline(
+                        user_id, screening["metrics"], risk_score,
+                        reaction_ms=reaction_ms
+                    )
+
+                    st.success(
+                        f"'{user_id_display}'님의 기준선으로 저장했어요. "
+                        f"다음 검사부터 이 결과와 비교해서 보여드릴게요."
+                    )
+
+            else:
+
+                st.write(
+                    f"**기준선 측정일**: {baseline['saved_at']} "
+                    f"(당시 참고 점수: {baseline['risk_score']:.1f})"
+                )
+
+                base_metrics = baseline["metrics"]
+                curr_metrics = screening["metrics"]
+
+                compare_rows = [
+                    ("표정 변화", "expression_change"),
+                    ("미세 근육 움직임", "micro_movement"),
+                    ("안면 비대칭", "facial_asymmetry"),
+                    ("눈 깜빡임 빈도(회/분)", "blink_rate"),
+                    ("시선 이동 변동성", "gaze_variability"),
+                ]
+
+                for label, key in compare_rows:
+
+                    base_val = base_metrics.get(key)
+                    curr_val = curr_metrics.get(key)
+
+                    if base_val is None or curr_val is None:
+                        st.write(f"- {label}: 비교 불가 (측정 안 됨)")
+                        continue
+
+                    delta = curr_val - base_val
+                    arrow = "🔺" if delta > 0 else ("🔻" if delta < 0 else "➖")
+
+                    st.write(
+                        f"- {label}: 기준 {base_val:.2f} → 현재 "
+                        f"{curr_val:.2f} ({arrow} {delta:+.2f})"
+                    )
+
+                risk_delta = risk_score - baseline["risk_score"]
+                st.write(
+                    f"- **참고 점수**: 기준 "
+                    f"{baseline['risk_score']:.1f} → 현재 {risk_score:.1f} "
+                    f"({risk_delta:+.1f})"
+                )
+
+                if st.button(
+                    "이번 결과로 기준선 갱신",
+                    use_container_width=True
+                ):
+
+                    save_baseline(
+                        user_id, screening["metrics"], risk_score,
+                        reaction_ms=reaction_ms
+                    )
+
+                    st.success("기준선을 이번 결과로 갱신했어요.")
+
+        else:
+            st.info("위에 이름 또는 별명을 입력하면 이 기능을 사용할 수 있어요.")
+
+
+        if st.button(
+            "🔄 처음부터 다시 검사",
+            use_container_width=True
+        ):
+
+            reset_app()
+
+            st.rerun()
+
+
+# ============================================================
+# 안내
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "※ 본 프로그램은 촬영 전 사전 조건 확인용 프로토타입이며 "
+    "의료적 진단을 대신하지 않습니다."
+)
+
+
+# ============================================================
+# 임시 디버그 코드 — 확인 끝나면 이 블록 전체를 삭제하고 다시 커밋하세요.
+# ============================================================
+with st.sidebar:
+    if st.button("🔧 population/baseline store 확인"):
+        for _debug_fname in ["population_store.json", "baseline_store.json"]:
+            st.write(f"**{_debug_fname}**")
+            if os.path.exists(_debug_fname):
+                with open(_debug_fname, "r", encoding="utf-8") as _debug_f:
+                    st.json(json.load(_debug_f))
+            else:
+                st.write("파일이 아직 없습니다 (한 번도 저장된 적 없음).")
+# ============================================================
+
