@@ -277,7 +277,8 @@ const EP = (perfT) => Math.round(performance.timeOrigin + perfT);   // 절대 �
     const nSimple = (args && args.simple_n) ? Number(args.simple_n) : 10;
     const nGng = (args && args.gonogo_n) ? Number(args.gonogo_n) : 24;
     const t0 = Date.now();
-    await VM.start();
+    show("info","<div>과제를 준비하고 있어요…</div><small>마이크 사용 허용 창이 뜨면 '허용'을 눌러 주세요.<br>(허용하지 않아도 터치로 진행됩니다)</small>","준비 중");
+    await Promise.race([VM.start(), new Promise(r=>setTimeout(()=>{if(VM.status==="starting")VM.status="timeout";r();},6000))]);
     const simple = await runSimple(nSimple);
     const gonogo = await runGng(nGng, simple.summary.median_ms);
     show("done", "<div><b>두 과제를 마쳤어요.</b></div><div>수고하셨습니다.</div>", "완료");
@@ -306,6 +307,9 @@ const EP = (perfT) => Math.round(performance.timeOrigin + perfT);   // 절대 �
     setComponentValue(out);
   }
 
+  function showErr(msg){try{stage.className="info";stage.innerHTML="<div><b>화면 오류가 났어요</b></div><small>"+String(msg).replace(/</g,"&lt;").slice(0,300)+"</small><small>이 화면을 캡처해 알려 주세요.</small>";}catch(_){}}
+  window.addEventListener("error", e => showErr(e.message+" @"+(e.filename||"").split("/").pop()+":"+e.lineno));
+  window.addEventListener("unhandledrejection", e => showErr("promise: "+(e.reason&&e.reason.message||e.reason)));
   window.addEventListener("message", (event) => {
     const data = event.data;
     if(!data || data.type !== "streamlit:render") return;
