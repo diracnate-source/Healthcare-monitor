@@ -344,7 +344,8 @@ async function main(args){
   TS=args&&args.time_scale?Number(args.time_scale):1.0;DEBUG=!!(args&&args.debug);
   const setKey=(args&&SETS[args.word_set])?args.word_set:["A","B","C"][Math.floor(Math.random()*3)];
   const started_at=Date.now();
-  await VM.start();
+  show("info","<div>과제 3~9를 준비하고 있어요…</div><small>마이크 사용 허용 창이 뜨면 '허용'을 눌러 주세요.<br>(허용하지 않아도 터치로 진행됩니다)</small>","준비 중");
+  await Promise.race([VM.start(), new Promise(r=>setTimeout(()=>{if(VM.status==="starting")VM.status="timeout";r();},6000))]);
   const words=await runWords(setKey);
   const digits=await runDigits();
   const trail=await runTrail();
@@ -358,6 +359,9 @@ async function main(args){
     device:{user_agent:navigator.userAgent,screen_w:screen.width,screen_h:screen.height,dpr:devicePixelRatio,touch:("ontouchstart" in window)||navigator.maxTouchPoints>0,time_scale:TS},
     started_at,finished_at:Date.now(),note:"research prototype; items not clinically validated"});
 }
+function showErr(msg){try{stage.className="";stage.innerHTML="<div><b>화면 오류가 났어요</b></div><small>"+String(msg).replace(/</g,"&lt;").slice(0,300)+"</small><small>이 화면을 캡처해 알려 주세요.</small>";}catch(_){}}
+window.addEventListener("error",e=>showErr(e.message+" @"+(e.filename||"").split("/").pop()+":"+e.lineno));
+window.addEventListener("unhandledrejection",e=>showErr("promise: "+(e.reason&&e.reason.message||e.reason)));
 window.addEventListener("message",e=>{const d=e.data;if(!d||d.type!=="streamlit:render")return;
   if(!started){started=true;main(d.args||{});}setFrameHeight(560);});
 setFrameHeight(560);componentReady();
