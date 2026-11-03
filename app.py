@@ -278,6 +278,21 @@ if "reaction_target_delay_ms" not in st.session_state:
 if "cog_task_run" not in st.session_state:
     st.session_state.cog_task_run = 0
 
+APP_BUILD = "V2.3 (2026-11-03 21:40)"
+
+if "flow_log" not in st.session_state:
+    st.session_state.flow_log = []
+
+
+def _flow(msg):
+    """진행 경로 기록(진단용). 개인정보 없음. 리포트의 연구용 기록에 표시된다."""
+    log = st.session_state.flow_log
+    stamp = time.strftime("%H:%M:%S")
+    if not log or not log[-1].endswith(msg):
+        log.append(f"{stamp} {msg}")
+    del log[:-40]
+
+
 if "cog_a" not in st.session_state:
     st.session_state.cog_a = None
 
@@ -311,6 +326,7 @@ def reset_app():
     # 인지과제 컴포넌트 key를 바꿔야 다시 시작할 때 이전 완료값이 남지 않는다
     st.session_state.cog_task_run += 1
     st.session_state.cog_a = None
+    st.session_state.flow_log = []
     st.session_state.voice_result = None
     st.session_state.voice_wait_start = None
     st.session_state.task_camera_processor = None
@@ -1570,6 +1586,7 @@ def analyze_task_camera(processor, task_data):
 def render_research_records(voice, task_data):
     """리포트 화면의 연구용 기록 표시(참고용). 점수 계산에는 쓰이지 않는다."""
     with st.expander("🔬 과제·카메라·음성 기록 (연구용, 참고)"):
+        st.caption(f"앱 버전 {APP_BUILD}")
         st.caption(
             "※ 진단이 아니며 임상 검증 전의 참고 기록입니다. 위험도 점수 계산에는 "
             "아직 반영되지 않습니다. 소리 원본과 영상은 저장하지 않습니다."
@@ -1605,6 +1622,11 @@ def render_research_records(voice, task_data):
             if task_data.get("camera"):
                 st.markdown("**과제 구간별 카메라 보조 신호**")
                 st.json(task_data["camera"])
+        if not task_data:
+            st.warning("과제 기록이 없습니다. (과제를 끝까지 마치지 않았거나 '건너뛰기'를 눌렀을 때 이렇게 됩니다.) 아래 진행 기록을 알려 주세요.")
+        if st.session_state.get("flow_log"):
+            st.markdown("**진행 기록(진단용)**")
+            st.code("\n".join(st.session_state.flow_log))
         if voice:
             st.markdown("**속담 낭독 음성 시간 정보**")
             if voice.get("status") == "ok":
@@ -2739,8 +2761,11 @@ elif st.session_state.stage == "reaction_test":
     )
 
 
+    st.caption(f"앱 버전 {APP_BUILD}")
+
     if st.session_state.reaction_result is not None:
 
+        _flow("이미 저장된 반응 결과가 있어 결과로 이동")
         st.session_state.stage = "report"
         st.rerun()
 
@@ -2750,6 +2775,8 @@ elif st.session_state.stage == "reaction_test":
     with skip_col:
 
         if st.button("건너뛰기 (측정 안 함)"):
+
+            _flow("'건너뛰기(측정 안 함)' 버튼을 눌러 결과로 이동")
 
             st.session_state.reaction_result = {
                 "reaction_ms": None
@@ -2775,8 +2802,11 @@ elif st.session_state.stage == "reaction_test":
         component_value = None
         if a_value is not None and a_value.get("status") == "ok":
             st.session_state.cog_a = dict(a_value)
+            _flow("과제 1·2 완료 → 과제 3~9로 이동")
             st.rerun()
     else:
+        _flow("과제 3~9 화면 표시")
+        st.success("✅ 과제 1·2를 마쳤어요. 이어서 과제 3~9를 진행합니다. 아래 화면이 비어 있으면 잠시 기다려 주세요.")
         component_value = cognitive_tasks_b_component(
             time_scale=float(os.environ.get("COG_TIME_SCALE", "1.0")),   # 시험용(기본 1.0)
             debug=os.environ.get("COG_DEBUG") == "1",
@@ -2821,8 +2851,9 @@ elif st.session_state.stage == "reaction_test":
 
     if component_value is not None and component_value.get("status") == "ok":
 
+        _flow("과제 3~9 완료")
         b_value = dict(component_value)
-        task_data = dict(st.session_state.cog_a)
+        task_data = dict(st.session_state.cog_a or {})
         reaction_ms = task_data.get("reaction_ms")
         task_data["b"] = b_value
         # 카메라 구간 분석용: 두 단계의 구간(block)과 이벤트를 합친다
