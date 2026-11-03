@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html,body{margin:0;padding:0;font-family:-apple-system,"Malgun Gothic","Noto Sans KR",sans-serif;}
+  #wrap{padding:4px;}
+  #title{font-size:15px;color:#51636A;margin:0 0 6px 2px;}
+  #stage{box-sizing:border-box;min-height:430px;border-radius:14px;background:#0E3B43;color:#fff;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;
+    padding:18px;font-size:21px;line-height:1.45;user-select:none;-webkit-user-select:none;touch-action:manipulation;position:relative;}
+  #stage.light{background:#F5F6F2;color:#1B2B2E;}
+  #stage.done{background:#1F7A7A;}
+  button{font-size:21px;padding:15px 30px;border:0;border-radius:12px;background:#fff;color:#0E3B43;font-weight:bold;cursor:pointer;min-height:54px;}
+  button.sub{background:transparent;color:#cfe;font-size:15px;font-weight:normal;text-decoration:underline;padding:6px;min-height:0;}
+  .mic{font-size:14px;color:#7FD1C7;} #stage.light .mic{color:#1F7A7A;}
+  .big{font-size:56px;font-weight:bold;letter-spacing:2px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;}
+  .pad{display:grid;grid-template-columns:repeat(3,76px);gap:10px;}
+  .pad button{padding:0;height:66px;font-size:28px;}
+  .entered{font-size:34px;letter-spacing:8px;min-height:44px;}
+  .tgt{position:absolute;width:56px;height:56px;border-radius:50%;border:3px solid #0E3B43;background:#fff;color:#0E3B43;
+    font-size:26px;font-weight:bold;padding:0;display:flex;align-items:center;justify-content:center;}
+  .tgt.ok{background:#2ecc71;border-color:#1b8f4c;color:#fff;} .tgt.bad{background:#e74c3c;color:#fff;}
+  .opt{background:#fff;border:3px solid #DDE2DC;border-radius:12px;padding:6px;min-height:0;}
+  .opt.sel{border-color:#1F7A7A;background:#E8F3F1;}
+  .wopt{min-width:96px;background:#fff;color:#1B2B2E;border:3px solid #DDE2DC;font-size:22px;padding:12px 14px;}
+  .wopt.sel{border-color:#1F7A7A;background:#E8F3F1;}
+  .q{font-size:20px;color:#1B2B2E;}
+  .bar{width:80%;height:10px;background:#2a5560;border-radius:5px;overflow:hidden;} .bar>div{height:100%;width:0;background:#7FD1C7;}
+  small{font-size:14px;opacity:.85;}
+</style>
+</head>
+<body>
+<div id="wrap"><p id="title"></p><div id="stage"></div></div>
+<script src="voice_mon.js"></script>
+<script>
+function send(t,e){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:t},e||{}),"*");}
+function setComponentValue(v){send("streamlit:setComponentValue",{value:v,dataType:"json"});}
+function setFrameHeight(h){send("streamlit:setFrameHeight",{height:h});}
+function componentReady(){send("streamlit:componentReady",{apiVersion:1});}
+
+const stage=document.getElementById("stage"), titleEl=document.getElementById("title");
+let started=false, TS=1.0, DEBUG=false;
+window.__bot={};
+const EP=t=>Math.round(performance.timeOrigin+t);
+const now=()=>performance.now();
+const sleep=ms=>new Promise(r=>setTimeout(r,ms*TS));
+const rand=(a,b)=>a+Math.random()*(b-a);
+const shuffle=a=>{a=[...a];for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;};
+const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+const median=a=>{if(!a.length)return null;const s=[...a].sort((x,y)=>x-y),m=s.length>>1;return s.length%2?s[m]:(s[m-1]+s[m])/2;};
+const sd=a=>{if(a.length<2)return null;const m=mean(a);return Math.sqrt(a.reduce((x,y)=>x+(y-m)*(y-m),0)/(a.length-1));};
+const r1=v=>v==null?null:Math.round(v*10)/10;
+const EV=[];
+const ev=(task,trial,event,t)=>EV.push({task,trial,event,t_epoch_ms:EP(t==null?now():t)});
+
+function show(cls,html,title){stage.className=cls||"";stage.innerHTML=html;if(title!==undefined)titleEl.textContent=title;}
+function paint(){return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r(now()))));}
+function addBtn(label,cls,parent){const b=document.createElement("button");b.textContent=label;if(cls)b.className=cls;(parent||stage).appendChild(b);return new Promise(r=>{b.onclick=()=>r(now());});}
+// 안내 화면: 'start' 또는 'skip'
+function intro(html,title){
+  show("",html,title);
+  const row=document.createElement("div");row.className="row";stage.appendChild(row);
+  return new Promise(res=>{
+    const s=document.createElement("button");s.textContent="시작";s.onclick=()=>res("start");row.appendChild(s);
+    const k=document.createElement("button");k.className="sub";k.textContent="건너뛰기";k.onclick=()=>res("skip");stage.appendChild(k);
+  });
+}
+const vfe=(a,b)=>VM.ok()?VM.features(a,b):{n_segments:null,first_onset_ms:null,speech_time_s:null};
+const MICNOTE=()=>VM.ok()?'<div class="mic">🎤 소리 크기만 계산해요(녹음 안 함)</div>':'<div class="mic">마이크 없음 · 터치로만 진행</div>';
+const skipped=(name,t0)=>({skipped:true,reason:"user_skip",block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(now())}});
+
+// ---------- 단어 세트 (독자 제작 예시, 기존 검사 단어 아님) ----------
+const SETS={A:["우산","기차","거울","포도","의자"],B:["시계","다리","고래","구두","접시"],C:["책상","비행기","감자","안경","열쇠"]};
+
+// ---------- 3 단어 외우기 ----------
+async function runWords(setKey){
+  const words=SETS[setKey];
+  const a=await intro("<div><b>과제 3 · 단어 외우기</b></div><div>화면에 단어 5개가 하나씩 나옵니다.<br><b>각 단어를 소리 내어 읽어 주세요.</b><br>두 번 보여 드리니 잘 기억해 두세요.<br>나중에 다시 물어봅니다.</div>"+MICNOTE(),"3/9 · 단어 외우기");
+  const t0=now();
+  if(a==="skip") return skipped("words",t0);
+  const presented=[];
+  for(let round=0;round<2;round++){
+    for(const w of shuffle(words)){
+      show("",'<div class="big">'+w+'</div>',"3/9 · 단어 외우기 ("+(round+1)+"/2회)");
+      const t=await paint(); const rec={round:round+1,word:w,onset_epoch_ms:EP(t)}; presented.push(rec); ev("words",presented.length,"word_on",t);
+      await sleep(2000);
+      rec.voice=vfe(t,t+2000*TS);
+      show("","<div></div>"); await sleep(300);
+    }
+  }
+  const t1=now();
+  show("done","<div>잘 하셨어요.<br>이 단어들은 조금 뒤에 다시 물어볼게요.</div>"); await sleep(1500);
+  const vw=presented.map(p=>p.voice).filter(v=>v&&v.n_segments!==null);
+  return {skipped:false,set:setKey,words,presented,encode_end_epoch_ms:EP(t1),
+    voice_summary:{n_words_voiced:vw.filter(v=>v.n_segments>0).length,n_words:presented.length,
+      median_onset_ms:r1(median(vw.filter(v=>v.first_onset_ms!==null).map(v=>v.first_onset_ms)))},block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(t1)}};
+}
+
+// ---------- 4 숫자 따라 누르기 ----------
+function genSeq(n){
+  for(let k=0;k<500;k++){
+    const s=[];while(s.length<n){const d=1+Math.floor(Math.random()*9);if(!s.length||d!==s[s.length-1])s.push(d);}
+    let bad=false;for(let i=2;i<n;i++){const d1=s[i-1]-s[i-2],d2=s[i]-s[i-1];if(d1===d2&&Math.abs(d1)===1){bad=true;break;}}
+    if(!bad)return s;
+  }
+  return Array.from({length:n},(_,i)=>(i*3+2)%9+1);
+}
+function keypad(len){
+  show("","<div>"+(window.__digitPrompt||"")+"</div><div class='entered' id='ent'></div><div class='pad' id='pad'></div><div class='row' id='ctl'></div>");
+  const pad=document.getElementById("pad"),ent=document.getElementById("ent");
+  const resp=[],times=[];
+  return new Promise(res=>{
+    for(let d=1;d<=9;d++){const b=document.createElement("button");b.textContent=d;b.dataset.d=d;
+      b.onclick=()=>{const t=now();resp.push(d);times.push(EP(t));ent.textContent=resp.join(" ");ev("digits",0,"key",t);
+        if(resp.length>=len)res({resp,times});};pad.appendChild(b);}
+  });
+}
+async function digitTrial(dir,len,idx){
+  const seq=genSeq(len);window.__bot.digits={seq,dir};
+  show("","<div>숫자를 잘 보세요</div>");await sleep(800);
+  const onsets=[];
+  for(const d of seq){show("",'<div class="big">'+d+'</div>');const t=await paint();onsets.push(EP(t));ev("digits",idx,"digit_on",t);await sleep(1000);show("","<div></div>");await sleep(250);}
+  window.__digitPrompt=dir==="fwd"?"본 순서 그대로 <b>소리 내어 말한 뒤</b> 누르세요":"<b>거꾸로</b> 소리 내어 말한 뒤 누르세요 (마지막 숫자부터)";
+  const tIn=now();
+  const r=await keypad(len);
+  const voice=vfe(tIn,now());
+  const target=dir==="fwd"?seq:[...seq].reverse();
+  const correct=r.resp.length===target.length&&r.resp.every((v,i)=>v===target[i]);
+  const rec={dir,len,seq,target,resp:r.resp,correct,first_key_ms:r1(r.times[0]-EP(tIn)),total_input_ms:r1(r.times[r.times.length-1]-EP(tIn)),onsets_epoch_ms:onsets,voice};
+  show("","<div>"+(correct?"맞았어요":"다음으로 넘어갑니다")+"</div>");await sleep(700);
+  return rec;
+}
+async function runDigits(){
+  const a=await intro("<div><b>과제 4 · 숫자 따라 누르기</b></div><div>숫자가 하나씩 나왔다 사라집니다.<br>먼저 <b>본 순서대로</b> 2번,<br>다음에 <b>거꾸로</b> 3번,<br><b>소리 내어 말한 뒤</b> 키패드를 눌러 주세요.</div>"+MICNOTE(),"4/9 · 숫자 따라 누르기");
+  const t0=now();if(a==="skip")return skipped("digits",t0);
+  const trials=[];let n=0;
+  let L=3;
+  for(let i=0;i<2;i++){const r=await digitTrial("fwd",L,++n);trials.push(r);if(r.correct)L++;}
+  show("info","<div>이번에는 <b>거꾸로</b> 눌러 주세요.<br>예) 3 → 5 → 2 를 보면 2 → 5 → 3</div>");
+  await addBtn("시작");
+  L=2;
+  for(let i=0;i<3;i++){const r=await digitTrial("bwd",L,++n);trials.push(r);if(r.correct)L++;}
+  const t1=now();
+  const maxOf=d=>Math.max(0,...trials.filter(t=>t.dir===d&&t.correct).map(t=>t.len));
+  return {skipped:false,trials,summary:{max_forward_len:maxOf("fwd"),max_backward_len:maxOf("bwd"),
+    n_correct:trials.filter(t=>t.correct).length,n_trials:trials.length,
+    n_trials_voiced:trials.filter(t=>t.voice&&t.voice.n_segments>0).length,
+    median_voice_onset_ms:r1(median(trials.filter(t=>t.voice&&t.voice.first_onset_ms!==null).map(t=>t.voice.first_onset_ms))),
+    mean_total_input_ms:r1(mean(trials.map(t=>t.total_input_ms)))},
+    block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(t1)}};
+}
+
+// ---------- 5 숫자·도형 번갈아 잇기 ----------
+const SHAPES=["○","△","□","◇","☆","♡"];
+const TRAIL_ORDER=[];for(let i=0;i<6;i++){TRAIL_ORDER.push(String(i+1));TRAIL_ORDER.push(SHAPES[i]);}
+async function trailAttempt(no){
+  show("","");
+  const box=document.createElement("div");box.style.cssText="position:relative;width:100%;height:340px;";stage.appendChild(box);
+  const W=Math.min(stage.clientWidth-36,340),cols=3,rows=4,cw=W/cols,ch=340/rows;
+  const labels=shuffle(TRAIL_ORDER),cells=shuffle([...Array(12).keys()]);
+  const btns={};
+  labels.forEach((lab,i)=>{const c=cells[i],cx=(c%cols)*cw+cw/2,cy=Math.floor(c/cols)*ch+ch/2;
+    const jx=rand(-(cw/2-34),cw/2-34),jy=rand(-(ch/2-32),ch/2-32);
+    const b=document.createElement("button");b.className="tgt";b.textContent=lab;
+    b.style.left=(cx+jx-28+(stage.clientWidth-36-W)/2)+"px";b.style.top=(cy+jy-28)+"px";box.appendChild(b);btns[lab]=b;});
+  const taps=[];let idx=0,errors=0;
+  const tStart=await paint();ev("trail",no,"start",tStart);
+  window.__bot.trail=()=>TRAIL_ORDER[idx];
+  const limit=90000*TS;
+  return await new Promise(res=>{
+    const timer=setTimeout(()=>res({attempt:no,completed:false,time_ms:r1(now()-tStart),errors,taps,n_done:idx}),limit);
+    for(const lab of TRAIL_ORDER){btns[lab].onclick=()=>{
+      const t=now();
+      if(lab===TRAIL_ORDER[idx]){btns[lab].classList.add("ok");taps.push({label:lab,ok:true,t_ms:r1(t-tStart),epoch_ms:EP(t),_t:t});idx++;ev("trail",no,"tap_ok",t);
+        if(idx>=TRAIL_ORDER.length){clearTimeout(timer);
+          // 누르는 시점 앞뒤 700ms 안에 말소리가 있으면 '소리 내어 읽음'으로 본다
+          taps.forEach(x=>{if(x._t!==undefined){const v=vfe(x._t-700,x._t+700);x.voiced=v.n_segments===null?null:v.n_segments>0;delete x._t;}});
+          res({attempt:no,completed:true,time_ms:r1(t-tStart),errors,taps,n_done:idx});}}
+      else if(!btns[lab].classList.contains("ok")){errors++;taps.push({label:lab,ok:false,t_ms:r1(t-tStart),epoch_ms:EP(t)});ev("trail",no,"tap_err",t);
+        btns[lab].classList.add("bad");setTimeout(()=>btns[lab].classList.remove("bad"),300);}
+    };}
+  });
+}
+async function runTrail(){
+  const a=await intro("<div><b>과제 5 · 번갈아 잇기</b></div><div>숫자와 모양이 섞여 있습니다.<br><b>1 → ○ → 2 → △ → 3 → □ → 4 → ◇ → 5 → ☆ → 6 → ♡</b><br>순서대로 <b>소리 내어 읽으며</b> 눌러 주세요. 2번 합니다.</div>"+MICNOTE(),"5/9 · 번갈아 잇기");
+  const t0=now();if(a==="skip")return skipped("trail",t0);
+  const att=[];
+  for(let i=1;i<=2;i++){titleEl.textContent="5/9 · 번갈아 잇기 ("+i+"/2)";att.push(await trailAttempt(i));
+    show("done","<div>"+(i<2?"한 번 더 합니다":"수고하셨어요")+"</div>");await sleep(900);}
+  const t1=now();
+  const ok=att.filter(x=>x.completed);
+  return {skipped:false,attempts:att,summary:{n_completed:ok.length,best_time_ms:ok.length?Math.min(...ok.map(x=>x.time_ms)):null,
+    mean_time_ms:r1(mean(ok.map(x=>x.time_ms))),total_errors:att.reduce((s,x)=>s+x.errors,0),
+    voiced_ratio:(()=>{const a=att.flatMap(x=>x.taps).filter(x=>x.ok&&x.voiced!==null&&x.voiced!==undefined);return a.length?Math.round(a.filter(x=>x.voiced).length/a.length*100)/100:null;})()},
+    block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(t1)}};
+}
+
+// ---------- 6 동물 이름 말하기 (소리 크기 변화만) ----------
+const FRAME_MS=20,MIN_SEG=120,MERGE_GAP=200,MARGIN_DB=10,ABS_MIN=-55;
+const pct=(a,p)=>{const s=[...a].sort((x,y)=>x-y);return s[Math.min(s.length-1,Math.max(0,Math.floor(p*(s.length-1))))];};
+function analyzeVoice(db){
+  const floor=pct(db,0.2),thr=Math.max(floor+MARGIN_DB,ABS_MIN),act=db.map(v=>v>thr);
+  const segs=[];let i=0;while(i<act.length){if(act[i]){let j=i;while(j<act.length&&act[j])j++;segs.push([i*FRAME_MS,j*FRAME_MS]);i=j;}else i++;}
+  const mg=[];for(const s of segs){if(mg.length&&s[0]-mg[mg.length-1][1]<MERGE_GAP)mg[mg.length-1][1]=s[1];else mg.push([s[0],s[1]]);}
+  const kept=mg.filter(s=>s[1]-s[0]>=MIN_SEG),total=db.length*FRAME_MS,speech=kept.reduce((a,s)=>a+s[1]-s[0],0);
+  const gaps=[];for(let k=1;k<kept.length;k++)gaps.push(kept[k][0]-kept[k-1][1]);
+  const q=(a,b)=>kept.filter(s=>s[0]>=a&&s[0]<b).length;   // 구간별 말 시작 수(단어 수의 대용, 실제 단어 수 아님)
+  const speechDb=[];for(const s of kept)for(let f=Math.floor(s[0]/FRAME_MS);f<Math.floor(s[1]/FRAME_MS);f++)speechDb.push(db[f]);
+  const snr=speechDb.length?mean(speechDb)-floor:null;
+  let quality="ok";if(speech<1000)quality="no_speech";else if(snr!==null&&snr<8)quality="noisy";
+  return {noise_floor_db:r1(floor),threshold_db:r1(thr),segments:kept.map(s=>({start_ms:s[0],end_ms:s[1]})),quality,
+    features:{n_segments:kept.length,first_onset_ms:kept.length?kept[0][0]:null,speech_time_s:r1(speech/1000),
+      speech_ratio:Math.round(speech/total*1000)/1000,mean_pause_ms:gaps.length?Math.round(mean(gaps)):null,
+      max_pause_ms:gaps.length?Math.max(...gaps):null,n_pauses_over_1s:gaps.filter(g=>g>=1000).length,
+      onsets_0_10s:q(0,10000),onsets_10_20s:q(10000,20000),onsets_20_30s:q(20000,30000),snr_db:r1(snr)}};
+}
+async function runAnimals(){
+  const a=await intro("<div><b>과제 6 · 동물 이름 말하기</b></div><div>30초 동안 떠오르는 <b>동물 이름</b>을 소리 내어 말해 주세요.<br>같은 이름을 반복하지 않아도 됩니다.</div><small>마이크는 소리의 크기 변화만 계산합니다. 녹음하거나 저장하지 않아요.</small>","6/9 · 동물 이름 말하기");
+  const t0=now();if(a==="skip")return skipped("animals",t0);
+  if(!VM.ok()){
+    show("","<div>마이크를 사용할 수 없어 이 과제는 건너뜁니다.</div><small>다른 과제 결과에는 영향이 없어요.</small>");await sleep(1800);
+    return {skipped:true,reason:"mic_"+VM.status,block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(now())}};
+  }
+  show("","<div>3</div>");await sleep(700);show("","<div>2</div>");await sleep(700);show("","<div>1</div>");await sleep(700);
+  show("","<div><b>말씀해 주세요</b></div><div class='big' id='cd'>30</div><div class='bar'><div id='lv'></div></div>","6/9 · 동물 이름 말하기");
+  const cd=document.getElementById("cd"),lv=document.getElementById("lv");
+  const DUR=30000*TS,ts=now(),startEp=EP(ts);ev("animals",1,"start",ts);
+  await new Promise(res=>{const lvPrev=VM.onLevel;VM.onLevel=(d)=>{lv.style.width=Math.max(0,Math.min(100,(d+70)*100/60))+"%";};
+    const timer=setInterval(()=>{const n=now();cd.textContent=Math.max(0,Math.ceil((DUR-(n-ts))/1000/TS));
+      if(n-ts>=DUR){clearInterval(timer);VM.onLevel=lvPrev;res();}},100);});
+  const t1=now();ev("animals",1,"end",t1);
+  const db=VM.levels(ts,t1);
+  const out=analyzeVoice(db.length?db:[-100]);out.skipped=false;out.duration_s=30;out.start_epoch_ms=startEp;out.end_epoch_ms=EP(t1);
+  out.level_db_50hz=db.map(v=>Math.round(v));out.block={start_epoch_ms:startEp,end_epoch_ms:EP(t1)};
+  out.note="audio not recorded or transcribed; onsets_* are speech-segment counts, not word counts";
+  show("done","<div>수고하셨어요.</div>");await sleep(900);
+  return out;
+}
+
+// ---------- 7 도형 짝 맞추기 ----------
+const key=g=>g.map(r=>r.join("")).join("/");
+const rot=g=>{const n=[[0,0,0],[0,0,0],[0,0,0]];for(let r=0;r<3;r++)for(let c=0;c<3;c++)if(g[r][c])n[c][2-r]=1;return n;};
+const mir=g=>g.map(r=>[...r].reverse());
+const rotN=(g,k)=>{let x=g;for(let i=0;i<k;i++)x=rot(x);return x;};
+function connected(g){const cells=[];for(let r=0;r<3;r++)for(let c=0;c<3;c++)if(g[r][c])cells.push([r,c]);if(!cells.length)return false;
+  const seen=new Set([cells[0].join()]),st=[cells[0]];while(st.length){const [r,c]=st.pop();for(const [dr,dc] of [[1,0],[-1,0],[0,1],[0,-1]]){const nr=r+dr,nc=c+dc;
+    if(nr>=0&&nr<3&&nc>=0&&nc<3&&g[nr][nc]&&!seen.has(nr+","+nc)){seen.add(nr+","+nc);st.push([nr,nc]);}}}return seen.size===cells.length;}
+function chiralShape(){
+  for(let k=0;k<5000;k++){const g=[[0,0,0],[0,0,0],[0,0,0]];const idx=shuffle([...Array(9).keys()]).slice(0,5);idx.forEach(i=>g[Math.floor(i/3)][i%3]=1);
+    if(!connected(g))continue;const m=key(mir(g));let sym=false;for(let q=0;q<4;q++)if(key(rotN(g,q))===m)sym=true;if(sym)continue;
+    // 4방향이 모두 서로 달라야 회전 판별이 가능
+    const ks=new Set([0,1,2,3].map(q=>key(rotN(g,q))));if(ks.size<4)continue;return g;}
+  return [[1,0,0],[1,1,0],[0,1,1]];
+}
+function svg(g,size){const c=size/3;let s='<svg width="'+size+'" height="'+size+'" viewBox="0 0 '+size+' '+size+'"><rect width="'+size+'" height="'+size+'" fill="#fff"/>';
+  for(let r=0;r<3;r++)for(let q=0;q<3;q++)if(g[r][q])s+='<rect x="'+(q*c+1)+'" y="'+(r*c+1)+'" width="'+(c-2)+'" height="'+(c-2)+'" rx="4" fill="#1F7A7A"/>';return s+"</svg>";}
+async function shapeItem(i,k){
+  const g=chiralShape(),correct=rotN(g,k);
+  const m=mir(g),wrongRots=shuffle([0,1,2,3]).slice(0,3),opts=[{g:correct,ok:true},...wrongRots.map(q=>({g:rotN(m,q),ok:false}))];
+  const sh=shuffle(opts);window.__bot.shape=sh.findIndex(o=>o.ok);
+  show("light",'<div class="q">위 도형을 <b>돌린</b> 모양을 고르세요<br><small>(뒤집은 모양은 아니에요)</small><br><small>정했으면 \"이거요\"라고 말하고 누르세요</small></div><div>'+svg(g,96)+'</div><div class="row" id="opts"></div>',"7/9 · 도형 짝 맞추기 ("+i+"/8)");
+  const box=document.getElementById("opts");
+  return await new Promise(async res=>{
+    const t0=await paint();ev("shape",i,"item_on",t0);
+    sh.forEach((o,j)=>{const b=document.createElement("button");b.className="opt";b.innerHTML=svg(o.g,84);
+      b.onclick=()=>{const t=now();ev("shape",i,"choice",t);const v=vfe(t0,t+200);res({idx:i,rotation_deg:k*90,chosen:j,correct:o.ok,rt_ms:r1(t-t0),onset_epoch_ms:EP(t0),voice_onset_ms:v.first_onset_ms,voiced:v.n_segments===null?null:v.n_segments>0});};box.appendChild(b);});
+  });
+}
+async function runShape(){
+  const a=await intro("<div><b>과제 7 · 도형 짝 맞추기</b></div><div>도형 하나가 나옵니다.<br>그 도형을 <b>돌려서</b> 만든 모양을 4개 중에서 고르세요.<br>정했으면 <b>\"이거요\"</b>라고 말하고 누릅니다. 8번 합니다.</div>"+MICNOTE(),"7/9 · 도형 짝 맞추기");
+  const t0=now();if(a==="skip")return skipped("shape",t0);
+  const ks=shuffle([1,2,3,1,2,3,1,2]),items=[];
+  for(let i=0;i<8;i++){items.push(await shapeItem(i+1,ks[i]));show("light","<div></div>");await sleep(350);}
+  const t1=now(),rts=items.filter(x=>x.correct).map(x=>x.rt_ms);
+  return {skipped:false,items,summary:{n_items:8,n_correct:items.filter(x=>x.correct).length,accuracy:r1(items.filter(x=>x.correct).length/8*100)/100,
+    median_rt_correct_ms:r1(median(rts)),mean_rt_ms:r1(mean(items.map(x=>x.rt_ms))),
+    n_voiced:items.filter(x=>x.voiced).length,median_voice_onset_ms:r1(median(items.filter(x=>x.voice_onset_ms!==null).map(x=>x.voice_onset_ms)))},block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(t1)}};
+}
+
+// ---------- 8 단어 회상 (지연) ----------
+async function runRecall(words,setKey,encodeEndEp){
+  const a=await intro("<div><b>과제 8 · 단어 기억 확인</b></div><div>앞에서 보신 단어를 먼저 <b>소리 내어 말해 보고</b>(12초),<br>이어서 보기 10개 중 5개를 골라 주세요.</div>"+MICNOTE(),"8/9 · 단어 기억 확인");
+  const t0=now();if(a==="skip")return skipped("recall",t0);
+  // 먼저 기억나는 단어를 말로 해 본다 (말 구간만 기록, 내용은 알 수 없음)
+  show("","<div class='q' style='color:#fff'>기억나는 단어를 <b>소리 내어 말해 보세요</b></div><div class='big' id='cd2'>12</div><div class='bar'><div id='lv2'></div></div>");
+  const tS=now();ev("recall",0,"speak_start",tS);const cd2=document.getElementById("cd2");
+  await new Promise(res=>{const tm=setInterval(()=>{const n=now();cd2.textContent=Math.max(0,Math.ceil((12000*TS-(n-tS))/1000/TS));if(n-tS>=12000*TS){clearInterval(tm);res();}},100);});
+  const speak=vfe(tS,now());
+  const others=shuffle(["우산","기차","거울","포도","의자","시계","다리","고래","구두","접시","책상","비행기","감자","안경","열쇠"].filter(w=>!words.includes(w)&&!SETS[setKey].includes(w))).slice(0,5);
+  const cands=shuffle([...words,...others]);
+  window.__bot.recall=words;
+  show("light",'<div class="q">앞에서 본 단어를 <b>5개</b> 고르세요 (<span id="cnt">0</span>/5)</div><div class="row" id="w"></div><div class="row" id="c"></div>');
+  const box=document.getElementById("w"),cnt=document.getElementById("cnt");
+  const sel=[],selT=[];
+  const tOn=await paint();ev("recall",1,"on",tOn);
+  const done=await new Promise(res=>{
+    const sub=document.createElement("button");sub.textContent="선택 완료";sub.style.opacity=".4";
+    cands.forEach(w=>{const b=document.createElement("button");b.className="wopt";b.textContent=w;
+      b.onclick=()=>{const t=now();const i=sel.indexOf(w);
+        if(i>=0){sel.splice(i,1);selT.splice(i,1);b.classList.remove("sel");}
+        else if(sel.length<5){sel.push(w);selT.push(r1(t-tOn));b.classList.add("sel");ev("recall",1,"select",t);}
+        cnt.textContent=sel.length;sub.style.opacity=sel.length===5?"1":".4";};box.appendChild(b);});
+    sub.onclick=()=>{if(sel.length===5)res(now());};document.getElementById("c").appendChild(sub);
+  });
+  const hits=sel.filter(w=>words.includes(w)),intr=sel.filter(w=>!words.includes(w));
+  const t1=now();
+  return {skipped:false,set:setKey,targets:words,candidates:cands,selected:sel,select_times_ms:selT,spoken:speak,
+    summary:{spoken_segments:speak.n_segments,spoken_first_onset_ms:speak.first_onset_ms,hits:hits.length,intrusions:intr.length,omissions:words.length-hits.length,total_time_ms:r1(done-tOn),
+      delay_since_encoding_s:encodeEndEp?r1((EP(tOn)-encodeEndEp)/1000):null},block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(t1)}};
+}
+
+// ---------- 9 체크인 (독자 문항 예시, 확정 전) ----------
+const CHECK_ITEMS=[
+ "최근 한 달 사이 약속이나 물건 둔 곳을 전보다 자주 잊으셨나요?",
+ "최근 한 달 사이 익숙한 길이나 장소에서 헷갈린 적이 있으셨나요?",
+ "최근 한 달 사이 하려던 말이나 단어가 잘 떠오르지 않는 일이 전보다 늘었나요?",
+ "전화 사용, 계산, 기기 조작 같은 일상 일이 전보다 어려워졌나요?"];
+async function runCheckin(){
+  const a=await intro("<div><b>과제 9 · 짧은 체크인</b></div><div>최근 생활에 대한 질문 4개입니다.<br><b>질문을 소리 내어 읽고</b> 답을 눌러 주세요.<br>정답은 없습니다.</div>"+MICNOTE()+"<div><small>※ 문항은 시험용 예시이며 확정 전입니다.</small>","9/9 · 체크인");
+  const t0=now();if(a==="skip")return skipped("checkin",t0);
+  show("light",'<div class="q">지금 답하시는 분은 누구신가요?</div><div class="row" id="r"></div>');
+  const who=await new Promise(res=>{const r=document.getElementById("r");
+    [["본인","self"],["보호자·가족","caregiver"]].forEach(([l,v])=>{const b=document.createElement("button");b.textContent=l;b.style.cssText="background:#fff;border:3px solid #1F7A7A";b.onclick=()=>res(v);r.appendChild(b);});});
+  const ans=[];
+  for(let i=0;i<CHECK_ITEMS.length;i++){
+    show("light",'<div class="q">'+CHECK_ITEMS[i]+'</div><div class="row" id="r"></div>',"9/9 · 체크인 ("+(i+1)+"/4)");
+    const t0i=await paint();
+    const v=await new Promise(res=>{const r=document.getElementById("r");
+      [["예","yes"],["아니오","no"],["모르겠음","unsure"]].forEach(([l,val])=>{const b=document.createElement("button");b.textContent=l;b.style.cssText="background:#fff;border:3px solid #1F7A7A";b.onclick=()=>res(val);r.appendChild(b);});});
+    const t=now();ev("checkin",i+1,"answer",t);const vf=vfe(t0i,t);
+    ans.push({item:i+1,answer:v,rt_ms:r1(t-t0i),voice:vf,chars:CHECK_ITEMS[i].length,
+      read_chars_per_s:(vf.speech_time_s&&vf.speech_time_s>0.5)?r1(CHECK_ITEMS[i].length/vf.speech_time_s):null});
+  }
+  const t1=now();
+  return {skipped:false,respondent:who,answers:ans,summary:{n_yes:ans.filter(x=>x.answer==="yes").length,n_unsure:ans.filter(x=>x.answer==="unsure").length,n_items:4,
+      n_read_aloud:ans.filter(x=>x.voice&&x.voice.n_segments>0).length,median_read_chars_per_s:r1(median(ans.filter(x=>x.read_chars_per_s!==null).map(x=>x.read_chars_per_s)))},
+    note:"draft items, not validated; raw counts only, not scored",block:{start_epoch_ms:EP(t0),end_epoch_ms:EP(t1)}};
+}
+
+async function main(args){
+  TS=args&&args.time_scale?Number(args.time_scale):1.0;DEBUG=!!(args&&args.debug);
+  const setKey=(args&&SETS[args.word_set])?args.word_set:["A","B","C"][Math.floor(Math.random()*3)];
+  const started_at=Date.now();
+  await VM.start();
+  const words=await runWords(setKey);
+  const digits=await runDigits();
+  const trail=await runTrail();
+  const animals=await runAnimals();
+  const shape=await runShape();
+  const recall=await runRecall(SETS[setKey],setKey,words.skipped?null:words.encode_end_epoch_ms);
+  const checkin=await runCheckin();
+  show("done","<div><b>모든 과제를 마쳤어요.</b></div><div>수고하셨습니다.</div>","완료");
+  const blocks={};for(const [k,v] of Object.entries({words,digits,trail,animals,shape,recall,checkin}))if(v&&v.block&&!v.skipped)blocks[k]=v.block;
+  setComponentValue({status:"ok",word_set:setKey,words,digits,trail,animals,shape,recall,checkin,blocks,events:EV.concat(VM.allSegmentEvents()),voice:{status:VM.status,error:VM.error,noise_floor_db:r1(VM.floor),threshold_db:r1(VM.thr),note:"loudness envelope only; no audio recorded or transcribed"},
+    device:{user_agent:navigator.userAgent,screen_w:screen.width,screen_h:screen.height,dpr:devicePixelRatio,touch:("ontouchstart" in window)||navigator.maxTouchPoints>0,time_scale:TS},
+    started_at,finished_at:Date.now(),note:"research prototype; items not clinically validated"});
+}
+window.addEventListener("message",e=>{const d=e.data;if(!d||d.type!=="streamlit:render")return;
+  if(!started){started=true;main(d.args||{});}setFrameHeight(560);});
+setFrameHeight(560);componentReady();
+</script>
+</body>
+</html>
