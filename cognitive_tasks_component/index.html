@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin:0; padding:0; font-family:-apple-system,"Malgun Gothic","Noto Sans KR",sans-serif; }
+  #wrap { padding:4px; }
+  #title { font-size:15px; color:#51636A; margin:0 0 6px 2px; }
+  #stage {
+    box-sizing:border-box; min-height:300px; border-radius:14px; background:#333; color:#fff;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px;
+    text-align:center; padding:20px; font-size:22px; line-height:1.45;
+    user-select:none; -webkit-user-select:none; touch-action:manipulation;
+  }
+  #stage.idle { background:#333; }
+  #stage.go { background:#2ecc71; font-weight:bold; font-size:30px; }
+  #stage.nogo { background:#e67e22; font-weight:bold; font-size:30px; }
+  #stage.warn { background:#c0392b; }
+  #stage.info { background:#0E3B43; }
+  #stage.done { background:#1F7A7A; }
+  .shape { width:110px; height:110px; background:#fff; opacity:.95; }
+  .circle { border-radius:50%; }
+  button { font-size:22px; padding:16px 36px; border:0; border-radius:12px; background:#fff; color:#0E3B43; font-weight:bold; cursor:pointer; }
+  small { font-size:15px; opacity:.85; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <p id="title"></p>
+  <div id="stage" class="info"></div>
+</div>
+
+<script src="voice_mon.js"></script>
+<script>
+  // Streamlit 커스텀 컴포넌트 저수준 프로토콜 (기존 reaction_timer_component와 동일 방식)
+  function send(type, extra){ window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type}, extra||{}), "*"); }
+  function setComponentValue(v){ send("streamlit:setComponentValue", {value:v, dataType:"json"}); }
+  function setFrameHeight(h){ send("streamlit:setFrameHeight", {height:h}); }
+  function componentReady(){ send("streamlit:componentReady", {apiVersion:1}); }
+
+  const stage = document.getElementById("stage");
+  const titleEl = document.getElementById("title");
+  let started = false;
+  let TS = 1.0;            // time scale
+  let handler = null;      // 현재 눌림을 받는 함수
+
+const EP = (perfT) => Math.round(performance.timeOrigin + perfT);   // 절대 시각(ms, epoch)
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms * TS));
+  const rand = (a,b) => a + Math.random()*(b-a);
+
+  stage.addEventListener("pointerdown", (e) => {
+    if (e.target.tagName === "BUTTON") return;
+    const t = performance.now();
+    if (handler) handler(t);
+  });
+
+  function show(cls, html, title){
+    stage.className = cls;
+    stage.innerHTML = html;
+    if (title !== undefined) titleEl.textContent = title;
+  }
+  function paintTime(){            // 화면에 실제로 그려진 뒤의 시각
+    return new Promise(res => requestAnimationFrame(() => requestAnimationFrame(() => res(performance.now()))));
+  }
+  async function showStim(cls, html){
+    show(cls, html);
+    return await paintTime();
+  }
+  function clickButton(label, small){
+    return new Promise(res => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = () => res();
+      stage.appendChild(b);
+    });
+  }
+
+  // 응답은 '화면 터치' 또는 '소리 내어 말하기(네!)' 중 먼저 오는 것. 말 시작 시각은 음성 모니터가 정한다.
+  // 대기 중 눌림/말소리 횟수를 센다 (성급한 반응)
+  function waitCounting(ms){
+    return new Promise(res => {
+      let n = 0; const t0 = performance.now();
+      handler = () => { n++; };
+      const unsub = VM.subscribe(st => { if(st >= t0) n++; });
+      setTimeout(() => { handler = null; unsub(); res(n); }, ms * TS);
+    });
+  }
+  // 지정 시간 안에 응답을 기다린다. {t, ch} 또는 null
+  function waitPress(ms){
+    return new Promise(res => {
+      let done = false; const t0 = performance.now();
+      const fin = (v) => { if(!done){ done = true; clearTimeout(timer); handler = null; unsub(); res(v); } };
+      const timer = setTimeout(() => fin(null), ms * TS);
+      const unsub = VM.subscribe(st => { if(st >= t0) fin({t: st, ch: "voice"}); });
+      handler = (t) => fin({t: t, ch: "touch"});
+    });
+  }
+  // 대기 중 응답이 오면 true (성급한 반응), 끝까지 없으면 false
+  function waitOrEarly(ms){
+    return new Promise(res => {
+      let done = false; const t0 = performance.now();
+      const fin = (v) => { if(!done){ done = true; clearTimeout(timer); handler = null; unsub(); res(v); } };
+      const timer = setTimeout(() => fin(false), ms * TS);
+      const unsub = VM.subscribe(st => { if(st >= t0) fin(true); });
+      handler = () => fin(true);
+    });
+  }
+
+  // ---------- 통계 ----------
+  const mean = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
+  const median = a => { if(!a.length) return null; const s=[...a].sort((x,y)=>x-y); const m=s.length>>1; return s.length%2? s[m] : (s[m-1]+s[m])/2; };
+  const sd = a => { if(a.length<2) return null; const m=mean(a); return Math.sqrt(a.reduce((x,y)=>x+(y-m)*(y-m),0)/(a.length-1)); };
+  const round1 = v => v===null||v===undefined ? null : Math.round(v*10)/10;
+
+  // ---------- 1) 단순 반응 ----------
+  async function simpleTrial(practice){
+    let early = 0;
+    for(;;){
+      show("idle", "<div>준비하세요…</div>");
+      const wasEarly = await waitOrEarly(rand(1000, 3000));
+      if(wasEarly){
+        early++;
+        show("warn", "<div>너무 빨리 눌렀어요.<br>초록색이 나온 뒤에 눌러 주세요.</div>");
+        await sleep(1000);
+        if(early >= 3) return {practice, rt:null, early, omission:true, aborted:true};
+        continue;
+      }
+      const onset = await showStim("go", '<div class="shape circle"></div><div>지금 \"네!\" 또는 누르세요!</div>');
+      const onsetEp = EP(onset);
+      const resp = await waitPress(3000);
+      if(resp === null){
+        show("warn", "<div>놓쳤어요.</div>");
+        await sleep(700);
+        return {practice, rt:null, early, omission:true, aborted:false, onset_epoch_ms:onsetEp, resp_epoch_ms:null};
+      }
+      const t = resp.t;
+      const rt = t - onset;
+      show("done", "<div>" + Math.round(rt) + " ms</div>");
+      await sleep(500);
+      return {practice, rt:round1(rt), channel:resp.ch, early, omission:false, aborted:false, onset_epoch_ms:onsetEp, resp_epoch_ms:EP(t)};
+    }
+  }
+  function summarizeSimple(trials){
+    const real = trials.filter(t => !t.practice);
+    const valid = real.filter(t => t.rt !== null && t.rt >= 100).map(t => t.rt);
+    return {
+      n_trials: real.length,
+      n_valid: valid.length,
+      mean_ms: round1(mean(valid)),
+      median_ms: round1(median(valid)),
+      sd_ms: round1(sd(valid)),
+      cv: (valid.length>=2 && mean(valid)) ? Math.round(sd(valid)/mean(valid)*1000)/1000 : null,
+      omissions: real.filter(t => t.omission).length,
+      anticipations_total: real.reduce((s,t)=>s+t.early, 0),
+      too_fast_lt100ms: real.filter(t => t.rt !== null && t.rt < 100).length,
+      n_voice_resp: real.filter(t => t.channel === "voice").length,
+      n_touch_resp: real.filter(t => t.channel === "touch").length
+    };
+  }
+  async function runSimple(n){
+    show("info", "<div><b>과제 1 · 단순 반응</b></div><div>화면이 초록색으로 바뀌면<br>최대한 빨리 <b>\"네!\"라고 말하세요</b>.<br>(말하기 어려우면 화면을 눌러도 됩니다)<br>먼저 연습 2번을 합니다.</div>" + (VM.ok() ? "" : "<small>마이크를 쓸 수 없어 화면 누르기로 진행합니다.</small>"), "1/2 · 단순 반응");
+    await clickButton("시작");
+    const trials = [];
+    for(let i=0;i<2;i++){ trials.push(await simpleTrial(true)); }
+    show("info", "<div>연습이 끝났어요.<br>이제 " + n + "번 진행합니다.</div>");
+    await clickButton("본 과제 시작");
+    const blockStart = EP(performance.now());
+    for(let i=0;i<n;i++){
+      titleEl.textContent = "1/2 · 단순 반응 (" + (i+1) + "/" + n + ")";
+      const r = await simpleTrial(false);
+      r.idx = i+1;
+      trials.push(r);
+    }
+    const blockEnd = EP(performance.now());
+    return {trials, summary: summarizeSimple(trials), block: {start_epoch_ms: blockStart, end_epoch_ms: blockEnd}};
+  }
+
+  // ---------- 2) 선택 반응 (Go/No-Go) ----------
+  function makeSequence(n){
+    const nNo = Math.round(n * 7/24);       // 약 30%
+    for(let attempt=0; attempt<200; attempt++){
+      const seq = Array(n).fill("go");
+      let placed = 0;
+      while(placed < nNo){
+        const i = 1 + Math.floor(Math.random()*(n-1));   // 첫 시행은 항상 Go
+        if(seq[i] === "go"){ seq[i] = "nogo"; placed++; }
+      }
+      let run = 0, ok = true;
+      for(const s of seq){ run = (s==="nogo") ? run+1 : 0; if(run > 2){ ok = false; break; } }
+      if(ok) return seq;
+    }
+    return Array.from({length:n}, (_,i) => (i%4===3) ? "nogo" : "go");
+  }
+  async function gngTrial(kind, practice){
+    show("idle", "<div>＋</div>");
+    const isiPresses = await waitCounting(rand(800, 1600));
+    const html = kind === "go"
+      ? '<div class="shape circle"></div><div>\"네!\" / 누르세요</div>'
+      : '<div class="shape"></div><div>말하지도 누르지도 마세요</div>';
+    const onset = await showStim(kind, html);
+    const resp = await waitPress(1000);
+    let rec = {practice, kind, isi_presses:isiPresses, rt:null, response:false, channel:null, onset_epoch_ms:EP(onset), resp_epoch_ms:null};
+    if(resp !== null){
+      const t = resp.t;
+      rec.response = true;
+      rec.channel = resp.ch;
+      rec.rt = round1(t - onset);
+      rec.resp_epoch_ms = EP(t);
+      if(practice){
+        show("idle", "<div>" + (kind==="go" ? "좋아요" : "누르지 않아야 했어요") + "</div>");
+        await sleep(700);
+      }
+    } else {
+      if(practice){ show("idle", "<div>" + (kind==="go" ? "놓쳤어요" : "잘했어요") + "</div>"); await sleep(700); }
+    }
+    rec.correct = (kind==="go") ? rec.response : !rec.response;
+    return rec;
+  }
+  function summarizeGng(trials, simpleMedian){
+    const real = trials.filter(t => !t.practice);
+    const go = real.filter(t => t.kind==="go");
+    const no = real.filter(t => t.kind==="nogo");
+    const hits = go.filter(t => t.response && t.rt >= 100);
+    const rts = hits.map(t => t.rt);
+    return {
+      n_trials: real.length, n_go: go.length, n_nogo: no.length,
+      go_hits: hits.length,
+      go_omissions: go.filter(t => !t.response).length,
+      nogo_commissions: no.filter(t => t.response).length,
+      nogo_correct_rejections: no.filter(t => !t.response).length,
+      go_accuracy: go.length ? Math.round(hits.length/go.length*1000)/1000 : null,
+      commission_rate: no.length ? Math.round(no.filter(t=>t.response).length/no.length*1000)/1000 : null,
+      go_rt_mean_ms: round1(mean(rts)),
+      go_rt_median_ms: round1(median(rts)),
+      go_rt_sd_ms: round1(sd(rts)),
+      go_rt_cv: (rts.length>=2 && mean(rts)) ? Math.round(sd(rts)/mean(rts)*1000)/1000 : null,
+      slowing_vs_simple_ms: (median(rts)!==null && simpleMedian!==null) ? round1(median(rts)-simpleMedian) : null,
+      isi_presses_total: real.reduce((s,t)=>s+t.isi_presses, 0),
+      n_voice_resp: real.filter(t => t.channel === "voice").length,
+      n_touch_resp: real.filter(t => t.channel === "touch").length
+    };
+  }
+  async function runGng(n, simpleMedian){
+    show("info", "<div><b>과제 2 · 구분해서 누르기</b></div><div><b style='color:#7dffb0'>초록 동그라미</b>가 나오면 <b>\"네!\"라고 말하고</b>(또는 누르고),<br><b style='color:#ffb86b'>주황 네모</b>가 나오면 <b>아무것도 하지 마세요</b>.<br>먼저 연습 4번을 합니다.</div>", "2/2 · 구분해서 누르기");
+    await clickButton("시작");
+    const trials = [];
+    for(const k of ["go","nogo","go","nogo"]){ trials.push(await gngTrial(k, true)); }
+    show("info", "<div>연습이 끝났어요.<br>이제 " + n + "번 진행합니다.</div>");
+    await clickButton("본 과제 시작");
+    const seq = makeSequence(n);
+    const blockStart = EP(performance.now());
+    for(let i=0;i<n;i++){
+      titleEl.textContent = "2/2 · 구분해서 누르기 (" + (i+1) + "/" + n + ")";
+      const r = await gngTrial(seq[i], false);
+      r.idx = i+1;
+      trials.push(r);
+    }
+    const blockEnd = EP(performance.now());
+    return {trials, summary: summarizeGng(trials, simpleMedian), block: {start_epoch_ms: blockStart, end_epoch_ms: blockEnd}};
+  }
+
+  // 공통 이벤트 로그: {task, trial, event, t_epoch_ms}
+  function buildEvents(simple, gonogo){
+    const ev = [];
+    for(const t of simple.trials){ if(t.practice) continue;
+      ev.push({task:"simple", trial:t.idx, event:"stimulus", t_epoch_ms:t.onset_epoch_ms});
+      if(t.resp_epoch_ms) ev.push({task:"simple", trial:t.idx, event:"response", t_epoch_ms:t.resp_epoch_ms}); }
+    for(const t of gonogo.trials){ if(t.practice) continue;
+      ev.push({task:"gonogo", trial:t.idx, event:"stimulus_"+t.kind, t_epoch_ms:t.onset_epoch_ms});
+      if(t.resp_epoch_ms) ev.push({task:"gonogo", trial:t.idx, event:"response", t_epoch_ms:t.resp_epoch_ms}); }
+    return ev;
+  }
+
+  async function main(args){
+    TS = (args && args.time_scale) ? Number(args.time_scale) : 1.0;
+    const nSimple = (args && args.simple_n) ? Number(args.simple_n) : 10;
+    const nGng = (args && args.gonogo_n) ? Number(args.gonogo_n) : 24;
+    const t0 = Date.now();
+    await VM.start();
+    const simple = await runSimple(nSimple);
+    const gonogo = await runGng(nGng, simple.summary.median_ms);
+    show("done", "<div><b>두 과제를 마쳤어요.</b></div><div>수고하셨습니다.</div>", "완료");
+    const out = {
+      status: "ok",
+      reaction_ms: simple.summary.median_ms,
+      simple: simple,
+      gonogo: gonogo,
+      blocks: {simple: simple.block, gonogo: gonogo.block},
+      events: buildEvents(simple, gonogo).concat(VM.allSegmentEvents()),
+      voice: {status: VM.status, error: VM.error, noise_floor_db: Math.round(VM.floor*10)/10, threshold_db: Math.round(VM.thr*10)/10,
+              simple: VM.features(VM.toPerf(simple.block.start_epoch_ms), VM.toPerf(simple.block.end_epoch_ms)),
+              gonogo: VM.features(VM.toPerf(gonogo.block.start_epoch_ms), VM.toPerf(gonogo.block.end_epoch_ms)),
+              note: "loudness envelope only; no audio recorded or transcribed"},
+      device: {
+        user_agent: navigator.userAgent,
+        screen_w: screen.width, screen_h: screen.height,
+        dpr: window.devicePixelRatio,
+        touch: ("ontouchstart" in window) || navigator.maxTouchPoints > 0,
+        time_scale: TS
+      },
+      started_at: t0,
+      finished_at: Date.now(),
+      note: "research prototype; items not clinically validated"
+    };
+    setComponentValue(out);
+  }
+
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if(!data || data.type !== "streamlit:render") return;
+    if(!started){ started = true; main(data.args || {}); }
+    setFrameHeight(420);
+  });
+  setFrameHeight(420);
+  componentReady();
+</script>
+</body>
+</html>
